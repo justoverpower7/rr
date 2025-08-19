@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>إضافة حساب تليجرام</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            direction: rtl;
+        }
+        
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+        }
+        
+        .logo {
+            font-size: 48px;
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 24px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+            text-align: right;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+        
+        input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: all 0.3s ease;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+            margin-top: 10px;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .step {
+            display: none;
+        }
+        
+        .step.active {
+            display: block;
+        }
+        
+        .progress {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 30px;
+        }
+        
+        .progress-step {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: #e1e5e9;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: #666;
+        }
+        
+        .progress-step.active {
+            background: #667eea;
+            color: white;
+        }
+        
+        .progress-step.completed {
+            background: #28a745;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">📱</div>
+        <h1>إضافة حساب تليجرام</h1>
+        
+        <div class="progress">
+            <div class="progress-step active" id="step1">1</div>
+            <div class="progress-step" id="step2">2</div>
+            <div class="progress-step" id="step3">3</div>
+        </div>
+        
+        <!-- خطوة 1: رقم الهاتف -->
+        <div class="step active" id="stepPhone">
+            <div class="form-group">
+                <label>رقم الهاتف</label>
+                <input type="tel" id="phone" placeholder="+964xxxxxxxxxx" required>
+            </div>
+            <div class="form-group">
+                <label>API ID</label>
+                <input type="number" id="apiId" placeholder="12345678" required>
+            </div>
+            <div class="form-group">
+                <label>API Hash</label>
+                <input type="text" id="apiHash" placeholder="abc123def456..." required>
+            </div>
+            <button class="btn" onclick="requestCode()">إرسال كود التحقق</button>
+        </div>
+        
+        <!-- خطوة 2: كود التحقق -->
+        <div class="step" id="stepCode">
+            <div class="form-group">
+                <label>كود التحقق</label>
+                <input type="text" id="code" placeholder="12345" maxlength="5" required>
+            </div>
+            <button class="btn" onclick="submitAuth()">تأكيد</button>
+            <button class="btn" style="background: #6c757d; margin-top: 10px;" onclick="goBack()">رجوع</button>
+        </div>
+        
+        <!-- خطوة 3: النجاح -->
+        <div class="step" id="stepSuccess">
+            <div style="font-size: 64px; margin-bottom: 20px;">✅</div>
+            <h2 style="color: #28a745; margin-bottom: 20px;">تم بنجاح!</h2>
+            <p>تم إضافة حسابك بنجاح. يمكنك الآن إغلاق هذه الصفحة والعودة للبوت.</p>
+        </div>
+        
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        let currentStep = 1;
+        const userId = window.location.pathname.split('/').pop() || 'default';
+        
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
+        }
+        
+        function hideStatus() {
+            document.getElementById('status').style.display = 'none';
+        }
+        
+        function updateProgress(step) {
+            for (let i = 1; i <= 3; i++) {
+                const stepEl = document.getElementById(`step${i}`);
+                stepEl.className = 'progress-step';
+                if (i < step) stepEl.classList.add('completed');
+                if (i === step) stepEl.classList.add('active');
+            }
+        }
+        
+        function showStep(step) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById(`step${step === 1 ? 'Phone' : step === 2 ? 'Code' : 'Success'}`).classList.add('active');
+            updateProgress(step);
+            currentStep = step;
+        }
+        
+        async function requestCode() {
+            const phone = document.getElementById('phone').value;
+            const apiId = document.getElementById('apiId').value;
+            const apiHash = document.getElementById('apiHash').value;
+            
+            if (!phone || !apiId || !apiHash) {
+                showStatus('يرجى ملء جميع الحقول', 'error');
+                return;
+            }
+            
+            hideStatus();
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'جاري الإرسال...';
+            
+            try {
+                const response = await fetch('/request_code', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        phone: phone,
+                        api_id: apiId,
+                        api_hash: apiHash
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus('تم إرسال كود التحقق لرقمك', 'success');
+                    setTimeout(() => {
+                        showStep(2);
+                        hideStatus();
+                    }, 2000);
+                } else {
+                    showStatus(result.error, 'error');
+                }
+            } catch (error) {
+                showStatus('خطأ في الاتصال', 'error');
+            }
+            
+            btn.disabled = false;
+            btn.textContent = 'إرسال كود التحقق';
+        }
+        
+        async function submitAuth() {
+            const phone = document.getElementById('phone').value;
+            const apiId = document.getElementById('apiId').value;
+            const apiHash = document.getElementById('apiHash').value;
+            const code = document.getElementById('code').value;
+            
+            if (!code) {
+                showStatus('يرجى إدخال كود التحقق', 'error');
+                return;
+            }
+            
+            hideStatus();
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = 'جاري التحقق...';
+            
+            try {
+                const response = await fetch('/submit_auth', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        phone: phone,
+                        api_id: apiId,
+                        api_hash: apiHash,
+                        code: code
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStep(3);
+                } else {
+                    showStatus(result.error, 'error');
+                }
+            } catch (error) {
+                showStatus('خطأ في الاتصال', 'error');
+            }
+            
+            btn.disabled = false;
+            btn.textContent = 'تأكيد';
+        }
+        
+        function goBack() {
+            showStep(1);
+            hideStatus();
+        }
+    </script>
+</body>
+</html>

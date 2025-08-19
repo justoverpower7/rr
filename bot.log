@@ -1,0 +1,6 @@
+2025-08-20 02:08:35,547 - __main__ - INFO - 🚀 بوت صيد أسماء المستخدمين بدأ!
+2025-08-20 02:08:35,548 - __main__ - INFO - Admin ID: 8018256893
+2025-08-20 02:08:36,442 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8477536676:AAHkqDt-5Ghcj3-pV1zzhb_zP2LAx5nA1Ck/getMe "HTTP/1.1 200 OK"
+2025-08-20 02:08:36,551 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8477536676:AAHkqDt-5Ghcj3-pV1zzhb_zP2LAx5nA1Ck/deleteWebhook "HTTP/1.1 200 OK"
+2025-08-20 02:08:36,557 - apscheduler.scheduler - INFO - Scheduler started
+2025-08-20 02:08:36,558 - telegram.ext.Application - INFO - Application started
