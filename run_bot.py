@@ -15,7 +15,7 @@ def main():
     """Run the bot with proper async handling"""
     try:
         bot = TelegramSniper()
-        bot.public_url = "upbeat-simplicity-production.up.railway.app"
+        bot.public_url = "rr-production.up.railway.app"
         print("🚀 Bot starting...")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         
