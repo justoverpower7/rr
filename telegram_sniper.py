@@ -6,19 +6,22 @@ import os
 import json
 import time
 import asyncio
-import requests
-import logging
-import threading
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from flask import Flask, request, jsonify, render_template
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
+from telethon import TelegramClient
+from telethon import functions
+from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
+from telethon.errors.rpcerrorlist import UsernameNotOccupiedError, UsernameInvalidError, FloodWaitError
+import logging
+import requests
 from pyrogram import Client
 from pyrogram.errors import FloodWait, UsernameOccupied, UsernameInvalid
 from pyrogram.raw.functions.contacts import ResolveUsername
-from flask import Flask, render_template, request, jsonify
-from telethon import TelegramClient
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +32,13 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Fix encoding on Windows
+import sys
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 logger = logging.getLogger(__name__)
 
 # Flask Web App للمصادقة
@@ -52,30 +62,109 @@ def submit_auth():
         api_hash = data.get('api_hash')
         code = data.get('code')
         
-        if not all([user_id, phone, api_id, api_hash]):
+        if not all([user_id, phone, api_id, api_hash, code]):
             return jsonify({'success': False, 'error': 'جميع الحقول مطلوبة'})
         
-        # حفظ البيانات مؤقتاً
-        auth_data = {
-            'user_id': user_id,
-            'phone': phone,
-            'api_id': int(api_id),
-            'api_hash': api_hash,
-            'code': code,
-            'timestamp': datetime.now().isoformat(),
-            'status': 'pending'
-        }
+        # قراءة phone_code_hash من الملف المؤقت
+        temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+        if not os.path.exists(temp_file):
+            return jsonify({'success': False, 'error': 'انتهت صلاحية الجلسة. أعد طلب الكود'})
+            
+        try:
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                temp_data = json.load(f)
+        except:
+            return jsonify({'success': False, 'error': 'خطأ في قراءة بيانات الجلسة'})
         
-        # حفظ في ملف مؤقت
-        os.makedirs("temp_auth", exist_ok=True)
-        temp_file = os.path.join("temp_auth", f"{user_id}_auth.json")
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(auth_data, f, ensure_ascii=False, indent=2)
+        # محاولة تسجيل الدخول
+        async def verify_code():
+            os.makedirs("temp_sessions", exist_ok=True)
+            session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
+            client = TelegramClient(session_path, int(api_id), api_hash)
+            
+            try:
+                await client.connect()
+                await client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=temp_data['phone_code_hash']
+                )
+                
+                # إنشاء session دائم
+                os.makedirs("sessions", exist_ok=True)
+                permanent_session = f"sessions/{user_id}_{phone.replace('+', '')}"
+                
+                # نسخ الجلسة للمجلد الدائم
+                if os.path.exists(f"{session_path}.session"):
+                    shutil.copy(f"{session_path}.session", f"{permanent_session}.session")
+                
+                await client.disconnect()
+                return True, "تم تسجيل الدخول بنجاح"
+                
+            except PhoneCodeExpiredError:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return False, "انتهت صلاحية الكود"
+            except PhoneCodeInvalidError:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return False, "كود التحقق غير صحيح"
+            except SessionPasswordNeededError:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return False, "يتطلب كلمة مرور إضافية (2FA)"
+            except Exception as e:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                error_msg = str(e)
+                if "expired" in error_msg.lower():
+                    return False, "انتهت صلاحية الكود"
+                elif "invalid" in error_msg.lower():
+                    return False, "كود التحقق غير صحيح"
+                else:
+                    return False, f"خطأ في تسجيل الدخول: {error_msg}"
         
-        return jsonify({'success': True, 'message': 'تم حفظ البيانات بنجاح!'})
+        # تشغيل العملية
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success, message = loop.run_until_complete(verify_code())
+        loop.close()
+        
+        if success:
+            # حفظ البيانات الكاملة
+            auth_data = {
+                'user_id': user_id,
+                'phone': phone,
+                'api_id': int(api_id),
+                'api_hash': api_hash,
+                'code': code,
+                'timestamp': datetime.now().isoformat(),
+                'status': 'completed',
+                'session_path': f"sessions/{user_id}_{phone.replace('+', '')}"
+            }
+            
+            final_file = os.path.join("temp_auth", f"{user_id}_auth.json")
+            with open(final_file, 'w', encoding='utf-8') as f:
+                json.dump(auth_data, f, ensure_ascii=False, indent=2)
+            
+            # حذف الملف المؤقت
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+                
+            return jsonify({'success': True, 'message': 'تم إضافة الحساب بنجاح!'})
+        else:
+            return jsonify({'success': False, 'error': message})
         
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': f'خطأ غير متوقع: {str(e)}'})
 
 @app.route('/request_code', methods=['POST'])
 def request_code():
@@ -87,43 +176,50 @@ def request_code():
         api_id = int(data.get('api_id'))
         api_hash = data.get('api_hash')
         
-        # إنشاء session مؤقت وإرسال الكود
-        session_path = f"temp_sessions/{user_id}_{phone}"
-        os.makedirs("temp_sessions", exist_ok=True)
+        if not all([user_id, phone, api_id, api_hash]):
+            return jsonify({'success': False, 'error': 'جميع الحقول مطلوبة'})
         
+        # دالة async لطلب الكود
         async def send_code():
+            os.makedirs("temp_sessions", exist_ok=True)
+            session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
             client = TelegramClient(session_path, api_id, api_hash)
-            await client.connect()
-            sent_code = await client.send_code_request(phone)
-            await client.disconnect()
             
-            # حفظ phone_code_hash مع البيانات
-            temp_data = {
-                'user_id': user_id,
-                'phone': phone,
-                'api_id': api_id,
-                'api_hash': api_hash,
-                'phone_code_hash': sent_code.phone_code_hash,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            os.makedirs("temp_auth", exist_ok=True)
-            temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(temp_data, f, ensure_ascii=False, indent=2)
-            
-            return sent_code
+            try:
+                await client.connect()
+                result = await client.send_code_request(phone)
+                
+                # حفظ phone_code_hash مؤقتاً
+                os.makedirs("temp_auth", exist_ok=True)
+                temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+                temp_data = {
+                    'phone_code_hash': result.phone_code_hash,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(temp_data, f, ensure_ascii=False, indent=2)
+                
+                await client.disconnect()
+                return True, "تم إرسال كود التحقق بنجاح"
+                
+            except Exception as e:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                return False, f"خطأ في إرسال الكود: {str(e)}"
         
-        # تشغيل العملية غير المتزامنة
+        # تشغيل العملية
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        sent_code = loop.run_until_complete(send_code())
+        success, message = loop.run_until_complete(send_code())
         loop.close()
         
-        return jsonify({'success': True, 'message': 'تم إرسال كود التحقق!'})
+        return jsonify({'success': success, 'message': message})
         
     except Exception as e:
-        return jsonify({'success': False, 'error': f'خطأ في إرسال الكود: {str(e)}'})
+        return jsonify({'success': False, 'error': f'خطأ غير متوقع: {str(e)}'})
 
 def start_web_server():
     """تشغيل خادم الويب - للاستضافة المجانية"""
@@ -144,6 +240,7 @@ class TelegramSniper:
         # Runtime maps for multi-user checking
         self.user_tasks: Dict[int, asyncio.Task] = {}
         self.user_status_msgs: Dict[int, int] = {}  # user_id -> message_id
+        self.user_clients: Dict[int, Optional[TelegramClient]] = {}  # track active clients per user
         self.pending_auth = {}  # المستخدمين في انتظار التحقق
         self.pending_input = {}
         self.pending_replacement = {}
@@ -153,7 +250,7 @@ class TelegramSniper:
         """Load all configuration from files"""
         config = {
             'bot_token': self.read_file('token'),
-            'admin_id': int(self.read_file('ID')),
+            'admin_id': int(self.read_file('ID', '0')),
             'accounts': self.read_json('info.json'),
             'types': self.read_json('type.json'),
             'choices': self.read_json('choice.json'),
@@ -162,12 +259,28 @@ class TelegramSniper:
         }
         return config
     
-    def read_file(self, filename: str) -> str:
+    def read_file(self, filename: str, default: str = "") -> str:
+        """Read content from file with fallback to environment variable"""
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                return f.read().strip()
-        except:
-            return ""
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        return content
+        except Exception as e:
+            logger.error(f"Error reading file {filename}: {e}")
+        
+        # Fallback to environment variables for critical files
+        env_map = {
+            'token': 'BOT_TOKEN',
+            'ID': 'ADMIN_ID'
+        }
+        env_var = env_map.get(filename)
+        if env_var:
+            env_value = os.environ.get(env_var)
+            if env_value:
+                return env_value
+        return default
     
     def write_file(self, filename: str, content: str):
         with open(filename, 'w', encoding='utf-8') as f:
@@ -239,12 +352,10 @@ class TelegramSniper:
     
     def add_user_list(self, user_id: int, usernames: List[str]):
         """Add usernames to user's list"""
-        current = self.get_user_list(user_id)
-        new_items = [u for u in usernames if u not in current]
-        if new_items:
-            all_items = current + new_items
-            self.write_user_list(user_id, all_items)
-    
+        current_usernames = self.get_user_list(user_id)
+        all_usernames = list(set(current_usernames + usernames))
+        self.write_user_list(user_id, all_usernames)
+
     def save_claimed_username(self, user_id: int, username: str):
         """Save claimed username to user's claimed list"""
         path = self.user_file_path(user_id, 'claimed.txt')
@@ -267,13 +378,20 @@ class TelegramSniper:
         prefs = self.get_user_prefs(user_id)
         return prefs.get('accounts', [])
     
-    def add_user_account(self, user_id: int, account_data: Dict):
-        """Add new account for user"""
+    def add_user_account(self, user_id: int, account: Dict) -> bool:
+        """Add account to user"""
         prefs = self.get_user_prefs(user_id)
         if 'accounts' not in prefs:
             prefs['accounts'] = []
-        prefs['accounts'].append(account_data)
+        
+        # Check if account already exists
+        for existing in prefs['accounts']:
+            if existing.get('phone') == account.get('phone'):
+                return False
+        
+        prefs['accounts'].append(account)
         self.set_user_prefs(user_id, prefs)
+        return True
     
     def get_user_session_path(self, user_id: int, phone: str) -> str:
         """Get session file path for user account"""
@@ -367,47 +485,43 @@ class TelegramSniper:
         
         return client
     
-    async def check_username(self, client: Client, username: str, operation_type: str) -> Tuple[bool, str]:
-        """Check if username is available"""
+    async def check_username(self, client: TelegramClient, username: str, operation_type: str) -> Tuple[bool, str]:
+        """Check if username is available using Telethon"""
         try:
-            result = await client.invoke(
-                ResolveUsername(username=username)
-            )
-            # If we get here, username exists (occupied)
+            # If entity resolves, the username exists (occupied)
+            await client.get_entity(username)
             return False, "محتل"
-                
+        except UsernameNotOccupiedError:
+            return True, "متاح"
+        except UsernameInvalidError:
+            return False, "غير صالح"
+        except FloodWaitError as e:
+            return False, f"FLOOD_WAIT_{getattr(e, 'seconds', 60)}"
         except Exception as e:
-            error_str = str(e)
-            if "USERNAME_NOT_OCCUPIED" in error_str:
-                return True, "متاح"
-            elif "USERNAME_INVALID" in error_str:
-                return False, "غير صالح"
-            elif "FLOOD_WAIT" in error_str:
-                import re
-                match = re.search(r'(\d+)', error_str)
-                wait_time = int(match.group(1)) if match else 60
-                return False, f"FLOOD_WAIT_{wait_time}"
-            else:
-                return False, f"خطأ: {error_str[:50]}..."
+            return False, f"خطأ: {str(e)[:50]}..."
     
-    async def claim_username(self, client: Client, username: str, operation_type: str) -> Tuple[bool, str]:
-        """Attempt to claim available username"""
+    async def claim_username(self, client: TelegramClient, username: str, operation_type: str) -> Tuple[bool, str]:
+        """Attempt to claim available username using Telethon"""
         try:
-            if operation_type in ['c', 'ch']:  # Channel
-                channel = await client.create_channel(
-                    title=self.config['channel_name'] or f"Channel {username}",
-                    description=self.config['channel_about'] or f"Auto-created channel"
-                )
-                await client.set_chat_username(channel.id, username)
-                return True, "CHANNEL_CREATED"
-                
-            elif operation_type == 'a':  # Account
-                await client.set_username(username)
+            if operation_type == 'a':  # Account username
+                await client(functions.account.UpdateUsernameRequest(username=username))
                 return True, "USERNAME_SET"
-                
-            elif operation_type in ['b', 'bot']:  # Bot
+            elif operation_type in ['c', 'ch']:
+                # Create a new channel, then assign the username to it
+                title = self.config.get('channel_name') or f"Channel {username}"
+                about = self.config.get('channel_about') or "Auto-created channel"
+                res = await client(functions.channels.CreateChannelRequest(title=title, about=about, megagroup=False))
+                channel = res.chats[0] if getattr(res, 'chats', None) else None
+                if channel:
+                    await client(functions.channels.UpdateUsernameRequest(channel=channel, username=username))
+                    return True, "CHANNEL_CREATED"
+                return False, "CHANNEL_CREATE_FAILED"
+            elif operation_type in ['b', 'bot']:
                 return False, "BOT_CREATION_MANUAL"
-            
+            else:
+                return False, "UNSUPPORTED_OPERATION"
+        except FloodWaitError as e:
+            return False, f"CLAIM_ERROR: FLOOD_WAIT_{getattr(e, 'seconds', 60)}"
         except Exception as e:
             return False, f"CLAIM_ERROR: {str(e)}"
     
@@ -583,9 +697,18 @@ class TelegramSniper:
 
     async def handle_auth_flow(self, update, context, user_id, message_text):
         """معالجة عملية إضافة حساب جديد"""
+        # تحقق من ملفات temp_auth بدلاً من الذاكرة فقط
+        auth_file = os.path.join("temp_auth", f"{user_id}_auth.json")
         if user_id not in self.pending_auth:
-            return
-            
+            if not os.path.exists(auth_file):
+                return
+            # قراءة البيانات من الملف إذا لم تكن في الذاكرة
+            try:
+                with open(auth_file, 'r', encoding='utf-8') as f:
+                    self.pending_auth[user_id] = json.load(f)
+            except:
+                return
+                
         auth_data = self.pending_auth[user_id]
         step = auth_data.get('step', '')
         
@@ -626,96 +749,40 @@ class TelegramSniper:
                 )
                 
         elif step == 'api_hash':
-            # حفظ API Hash وإرسال كود التحقق
             auth_data['api_hash'] = message_text
-            auth_data['step'] = 'code'
             
-            try:
-                from telethon import TelegramClient
-                session_path = self.get_user_session_path(user_id, auth_data['phone'])
-                client = TelegramClient(session_path, auth_data['api_id'], auth_data['api_hash'])
-                await client.connect()
-                await client.send_code_request(auth_data['phone'])
-                auth_data['client'] = client
-                
-                await update.message.reply_text(
-                    "📨 *خطوة 4 من 4*\n\n"
-                    "✅ تم إرسال كود التحقق لرقمك\n"
-                    "🔹 أرسل الكود المرسل إليك\n"
-                    "🔹 مثال: 12345"
-                )
-            except Exception as e:
-                await update.message.reply_text(f"❌ خطأ في الإعدادات: {str(e)}")
-                del self.pending_auth[user_id]
-                
+            # Show web authentication URL
+            public_url = self.get_public_url()
+            web_url = f"https://{public_url}/auth/{user_id}"
             
-        elif step == 'code':
-            # التحقق من الكود وحفظ الحساب
-            try:
-                client = auth_data['client']
-                await client.sign_in(auth_data['phone'], message_text)
-                
-                # حفظ معلومات الحساب
-                account_info = {
-                    'phone': auth_data['phone'],
-                    'api_id': auth_data['api_id'],
-                    'api_hash': auth_data['api_hash'],
-                    'active': True
-                }
-                
-                # إضافة الحساب لقائمة المستخدم
-                prefs = self.get_user_prefs(user_id)
-                if 'accounts' not in prefs:
-                    prefs['accounts'] = []
-                prefs['accounts'].append(account_info)
-                self.set_user_prefs(user_id, prefs)
-                
-                await client.disconnect()
-                del self.pending_auth[user_id]
-                
-                await update.message.reply_text(
-                    "🎉 *تم إضافة الحساب بنجاح!*\n\n"
-                    f"📱 الهاتف: {auth_data['phone']}\n"
-                    "✅ جاهز للاستخدام"
-                )
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "expired" in error_msg or "timeout" in error_msg:
-                    # الكود منتهي الصلاحية - إعطاء خيار طلب كود جديد
-                    keyboard = [
-                        [InlineKeyboardButton("🔄 طلب كود جديد", callback_data="request_new_code")],
-                        [InlineKeyboardButton("❌ إلغاء", callback_data="cancel_auth")]
-                    ]
-                    await update.message.reply_text(
-                        "⏰ *انتهت صلاحية الكود!*\n\n"
-                        "🔹 كود التحقق صالح لمدة دقيقتين فقط\n"
-                        "🔹 يمكنك طلب كود جديد أو إلغاء العملية\n\n"
-                        "⚠️ تأكد من عدم مشاركة الكود مع أحد!",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                elif "invalid" in error_msg or "wrong" in error_msg:
-                    await update.message.reply_text(
-                        "❌ *كود خاطئ!*\n\n"
-                        "🔹 تأكد من إدخال الكود بشكل صحيح\n"
-                        "🔹 أرسل الكود مرة أخرى أو /start للإلغاء"
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"❌ *خطأ في التسجيل*\n\n"
-                        f"التفاصيل: {str(e)}\n\n"
-                        "🔄 جرب مرة أخرى أو /start للإلغاء"
-                    )
-                
-                # في حالة الأخطاء الخطيرة، إلغاء العملية
-                if "expired" not in error_msg:
-                    if 'client' in auth_data:
-                        try:
-                            await auth_data['client'].disconnect()
-                        except:
-                            pass
-                    del self.pending_auth[user_id]
+            await update.message.reply_text(
+                "🌐 *أكمل عملية المصادقة عبر الويب:*\n\n"
+                f"🔗 **الرابط:** {web_url}\n\n"
+                "📋 **الخطوات:**\n"
+                "1️⃣ اضغط على الرابط أعلاه\n"
+                "2️⃣ أدخل البيانات المطلوبة\n"
+                "3️⃣ أدخل كود التحقق\n"
+                "4️⃣ اضغط 'تحقق من الحالة' أدناه\n\n"
+                "⚠️ **تنبيه:** أكمل العملية خلال 3 دقائق",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 فتح الرابط", url=web_url)],
+                    [InlineKeyboardButton("📋 نسخ الرابط", callback_data="copy_url")],
+                    [InlineKeyboardButton("🔍 تحقق من الحالة", callback_data="check_web_auth")],
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="cancel_auth")]
+                ])
+            )
+            
+            # Change step to web_pending
+            auth_data['step'] = 'web_pending'
+            auth_data['web_url'] = web_url
+            auth_data['timestamp'] = datetime.now().isoformat()
+        
+        # Save auth data (pending) - keep separate from final auth file
+        os.makedirs("temp_auth", exist_ok=True)
+        auth_file = os.path.join("temp_auth", f"{user_id}_pending.json")
+        with open(auth_file, 'w', encoding='utf-8') as f:
+            json.dump(auth_data, f, ensure_ascii=False, indent=2)
 
     async def handle_username_input(self, update, user_id):
         """معالجة إضافة يوزرات جديدة"""
@@ -879,8 +946,16 @@ class TelegramSniper:
                 await self.user_settings_command(update.callback_query, context)
                 return
 
-        # ---------- Admin callbacks ----------
-        if user_id != self.config['admin_id']:
+        # ---------- Admin-only actions control ----------
+        admin_only = {
+            "scan_menu",
+            "scan_usernames_menu",
+            "scan_channels_menu",
+            "start_usernames_claim",
+            "start_channels_notify"
+        }
+        if data in admin_only and user_id != self.config['admin_id']:
+            await query.answer("هذه الميزة للمشرف فقط", show_alert=True)
             return
         
         if data == "scan_menu":
@@ -1005,7 +1080,7 @@ class TelegramSniper:
             )
         
         elif data == "status":
-            status_text = self.get_status_text()
+            status_text = self.get_status_text(user_id)
             await query.edit_message_text(
                 status_text,
                 parse_mode=ParseMode.MARKDOWN
@@ -1093,110 +1168,46 @@ class TelegramSniper:
                     )
                     del self.pending_auth[user_id]
             return
+
         
+        elif data == "copy_url":
+            # زر لنسخ الرابط (مجرد تنبيه للمستخدم)
+            public_url = self.get_public_url()
+            web_url = f"https://{public_url}/auth/{user_id}"
+            await query.answer(f"انسخ هذا الرابط: {web_url}", show_alert=True)
+            return
+        
+        elif data == "check_web_auth":
+            await self.check_auth_status(query, context, user_id)
+            return
+            
         elif data == "cancel_auth":
-            # إلغاء عملية إضافة الحساب
+            # إلغاء عملية المصادقة
             if user_id in self.pending_auth:
+                # حاول قطع أي عميل متبقٍ في الذاكرة ثم امسح الحالة
                 auth_data = self.pending_auth[user_id]
-                if 'client' in auth_data:
+                if isinstance(auth_data, dict) and 'client' in auth_data:
                     try:
                         await auth_data['client'].disconnect()
                     except:
                         pass
                 del self.pending_auth[user_id]
             
-            await query.edit_message_text(
-                "❌ *تم إلغاء إضافة الحساب*\n\n"
-                "يمكنك المحاولة مرة أخرى لاحقاً من قائمة \"حساباتي\"",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        
-        elif data == "copy_url":
-            # زر لنسخ الرابط (مجرد تنبيه للمستخدم)
-            web_url = f"http://localhost:5000/auth/{user_id}"
-            await query.answer(f"انسخ هذا الرابط: {web_url}", show_alert=True)
-            return
-        
-        elif data == "check_web_auth":
-            # التحقق من حالة المصادقة عبر الويب
-            temp_file = f"temp_auth/{user_id}_auth.json"
-            temp_hash_file = f"temp_auth/{user_id}_temp.json"
-            
-            if os.path.exists(temp_file) and os.path.exists(temp_hash_file):
-                try:
-                    with open(temp_file, 'r', encoding='utf-8') as f:
-                        auth_data = json.load(f)
-                    
-                    with open(temp_hash_file, 'r', encoding='utf-8') as f:
-                        hash_data = json.load(f)
-                    
-                    # محاولة تسجيل الدخول باستخدام البيانات
-                    from telethon import TelegramClient
-                    session_path = self.get_user_session_path(user_id, auth_data['phone'])
-                    client = TelegramClient(session_path, auth_data['api_id'], auth_data['api_hash'])
-                    
+            # احذف الملفات المؤقتة إن وجدت
+            for fname in [f"{user_id}_auth.json", f"{user_id}_temp.json", f"{user_id}_pending.json"]:
+                fpath = os.path.join("temp_auth", fname)
+                if os.path.exists(fpath):
                     try:
-                        await client.connect()
-                        # استخدام phone_code_hash المحفوظ
-                        await client.sign_in(
-                            phone=auth_data['phone'], 
-                            code=auth_data['code'],
-                            phone_code_hash=hash_data['phone_code_hash']
-                        )
-                        
-                        # حفظ معلومات الحساب
-                        account_info = {
-                            'phone': auth_data['phone'],
-                            'api_id': auth_data['api_id'],
-                            'api_hash': auth_data['api_hash'],
-                            'session_file': session_path,
-                            'active': True,
-                            'added_date': datetime.now().isoformat()
-                        }
-                        
-                        # إضافة الحساب للمستخدم
-                        prefs = self.get_user_prefs(user_id)
-                        if 'accounts' not in prefs:
-                            prefs['accounts'] = []
-                        prefs['accounts'].append(account_info)
-                        self.set_user_prefs(user_id, prefs)
-                        
-                        await client.disconnect()
-                        
-                        # حذف الملفات المؤقتة
-                        os.remove(temp_file)
-                        os.remove(temp_hash_file)
-                        
-                        await query.edit_message_text(
-                            "✅ *تم إضافة الحساب بنجاح!*\n\n"
-                            f"📱 الرقم: {auth_data['phone']}\n"
-                            f"🆔 API ID: {auth_data['api_id']}\n"
-                            "🔐 تم حفظ الجلسة بأمان\n\n"
-                            "يمكنك الآن استخدام البوت!",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                        
-                    except Exception as e:
-                        await client.disconnect()
-                        await query.edit_message_text(
-                            f"❌ فشل في تسجيل الدخول: {str(e)}\n\n"
-                            "تأكد من صحة الكود والبيانات",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                        
-                except Exception as e:
-                    await query.edit_message_text(
-                        f"❌ خطأ في قراءة البيانات: {str(e)}",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-            else:
-                await query.edit_message_text(
-                    "❌ لم يتم العثور على بيانات المصادقة\n\n"
-                    "تأكد من إكمال العملية في صفحة الويب أولاً",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                        os.remove(fpath)
+                    except:
+                        pass
+            
+            await query.edit_message_text(
+                "❌ تم إلغاء عملية إضافة الحساب",
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("🏠 الرئيسية", callback_data="back_main")
+                ]])
+            )
             return
         
         elif data.startswith("set_speed_"):
@@ -1254,9 +1265,30 @@ class TelegramSniper:
         query = update.callback_query if hasattr(update, 'callback_query') else update
         user_id = query.from_user.id if hasattr(query, 'from_user') else update.effective_user.id
         
-        # Stop any existing task for this user
+        # Stop any existing task for this user (gracefully)
         if user_id in self.user_tasks:
-            self.user_tasks[user_id].cancel()
+            # Signal running flag off first to let loop exit quickly
+            try:
+                prefs_tmp = self.get_user_prefs(user_id)
+                prefs_tmp['running'] = False
+                self.set_user_prefs(user_id, prefs_tmp)
+            except Exception:
+                pass
+            # Disconnect active client (break any pending network ops)
+            client = self.user_clients.get(user_id)
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            # Cancel and await a short time for clean exit
+            task = self.user_tasks.get(user_id)
+            if task:
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             
         # Check if user has active accounts
         user_accounts = self.get_user_accounts(user_id)
@@ -1279,10 +1311,8 @@ class TelegramSniper:
         prefs['mode'] = scan_type
         self.set_user_prefs(user_id, prefs)
         
-        # Start scanning task
-        task = asyncio.create_task(self.start_user_scan(user_id, context))
-        self.user_tasks[user_id] = task
-        
+        # Start scanning task (delegates task creation to start_user_scan)
+        await self.start_user_scan(user_id, context)
         return 1  # Return number of active users
     
     async def show_speed_settings(self, user_id, update, context):
@@ -1323,17 +1353,28 @@ class TelegramSniper:
         """إيقاف جميع الفاحصات"""
         # إيقاف مهام فاحصات المستخدمين
         for user_id, task in list(self.user_tasks.items()):
+            # تحديث إعدادات المستخدم وإيقاف العميل أولاً
+            try:
+                prefs = self.get_user_prefs(user_id)
+                prefs['running'] = False
+                self.set_user_prefs(user_id, prefs)
+            except Exception:
+                pass
+            client = self.user_clients.get(user_id)
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            # إلغاء وانتظار مدة محدودة لإيقاف المهمة
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-            # تحديث إعدادات المستخدم
-            prefs = self.get_user_prefs(user_id)
-            prefs['running'] = False
-            self.set_user_prefs(user_id, prefs)
         
         self.user_tasks.clear()
+        self.user_clients.clear()
         logger.info("Stopped all user checkers")
     
     async def start_user_scan(self, user_id: int, context):
@@ -1357,6 +1398,8 @@ class TelegramSniper:
             if not client:
                 return
             await client.start()
+            # Track active client to allow external stop
+            self.user_clients[user_id] = client
             msg = await context.bot.send_message(user_id, "🔍 بدء الفحص ...")
             self.user_status_msgs[user_id] = msg.message_id
             try:
@@ -1376,23 +1419,43 @@ class TelegramSniper:
                         continue
                     total = len(usernames)
                     for idx, username in enumerate(usernames, 1):
+                        # تحقق من إشارة التوقف بسرعة داخل الحلقة
+                        prefs = self.get_user_prefs(user_id)
+                        if not prefs.get('running', True):
+                            break
                         percent = int(idx/total*100)
                         # عرض حالة الفحص
                         checking_text = f"🔍 {idx}/{total} • {percent}%\nجاري فحص: @{username}..."
-                        await context.bot.edit_message_text(checking_text, chat_id=user_id, message_id=msg.message_id)
+                        try:
+                            await context.bot.edit_message_text(checking_text, chat_id=user_id, message_id=msg.message_id)
+                        except Exception:
+                            pass
                         
-                        op_type = 'c' if prefs.get('mode','users')=='channels' else 'a'
-                        is_available, status = await self.check_username(client, username, op_type)
+                        op_type = 'c' if user_mode == 'channels' else 'a'
+                        try:
+                            is_available, status = await asyncio.wait_for(
+                                self.check_username(client, username, op_type), timeout=15
+                            )
+                        except asyncio.TimeoutError:
+                            is_available, status = False, "TIMEOUT"
                         
                         # عرض النتيجة
                         result_text = f"🔍 {idx}/{total} • {percent}%\n@{username} → {status}"
-                        await context.bot.edit_message_text(result_text, chat_id=user_id, message_id=msg.message_id)
+                        try:
+                            await context.bot.edit_message_text(result_text, chat_id=user_id, message_id=msg.message_id)
+                        except Exception:
+                            pass
                         if is_available:
                             claim_mode = prefs.get('claim_mode', True)
                             if claim_mode:
                                 # وضع الحجز - محاولة حجز اليوزر
-                                op_type = 'c' if prefs.get('mode','users')=='channels' else 'a'
-                                claimed, _ = await self.claim_username(client, username, op_type)
+                                op_type = 'c' if user_mode == 'channels' else 'a'
+                                try:
+                                    claimed, _ = await asyncio.wait_for(
+                                        self.claim_username(client, username, op_type), timeout=30
+                                    )
+                                except asyncio.TimeoutError:
+                                    claimed = False
                                 if claimed:
                                     account_name = active_accounts[current_account_index]['first_name']
                                     await context.bot.send_message(user_id, 
@@ -1417,6 +1480,8 @@ class TelegramSniper:
                                     await client.stop()
                                     client = await self.get_user_client(user_id, active_accounts[current_account_index])
                                     await client.start()
+                                    # Update tracked client
+                                    self.user_clients[user_id] = client
                             else:
                                 # وضع الإشعار - إرسال إشعار فقط
                                 type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
@@ -1424,8 +1489,16 @@ class TelegramSniper:
                         # استخدام سرعة المستخدم المخصصة
                         delay = prefs.get('speed_delay', 2)
                         await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                pass
             finally:
                 await client.stop()
+                # Update UI message to reflect stop
+                try:
+                    await context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=msg.message_id)
+                except Exception:
+                    pass
+                self.user_clients.pop(user_id, None)
                 self.user_tasks.pop(user_id, None)
         # create task
         task = asyncio.create_task(scan_user_task())
@@ -1436,9 +1509,144 @@ class TelegramSniper:
         if self.public_url:
             return self.public_url
         
-        # Default PythonAnywhere URL
-        self.public_url = "upbeat-simplicity-production.up.railway.app"
+        # Railway environment variable or default
+        railway_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+        if railway_url:
+            self.public_url = railway_url
+            return railway_url
+            
+        # Default Railway URL
+        self.public_url = "rr-production.up.railway.app"
         return self.public_url
+
+    def get_status_text(self, user_id: int) -> str:
+        """بناء نص حالة المستخدم"""
+        prefs = self.get_user_prefs(user_id)
+        running = prefs.get('running', False)
+        mode = prefs.get('mode', 'users')
+        accounts = self.get_user_accounts(user_id)
+        total_accounts = len(accounts)
+        active_accounts = len([a for a in accounts if a.get('active', True)])
+        users_count = len(self.get_user_list(user_id))
+        channels_count = len(self.get_user_channels(user_id))
+        task_running = user_id in self.user_tasks
+        status_line = "قيد العمل" if running and task_running else "متوقف"
+        lines = []
+        lines.append("📊 *حالة الفحص*")
+        if total_accounts == 0:
+            lines.append("❌ لا توجد حسابات مضافة بعد.")
+            lines.append("أضف حساب من قائمة \"حساباتي\" للبدء.")
+        else:
+            lines.append(f"👤 الحسابات النشطة: {active_accounts}/{total_accounts}")
+            lines.append(f"🧭 وضع الفحص: {'يوزرات' if mode=='users' else 'قنوات'}")
+            lines.append(f"🔌 الحالة: {status_line}")
+        lines.append("")
+        lines.append(f"📥 عدد اليوزرات في قائمتك: {users_count}")
+        lines.append(f"📺 عدد القنوات في قائمتك: {channels_count}")
+        return "\n".join(lines)
+
+    async def check_auth_status(self, query, context, user_id: int):
+        """التحقق من إتمام المصادقة عبر الويب وإضافة الحساب"""
+        try:
+            auth_dir = "temp_auth"
+            os.makedirs(auth_dir, exist_ok=True)
+            final_file = os.path.join(auth_dir, f"{user_id}_auth.json")
+            temp_file = os.path.join(auth_dir, f"{user_id}_temp.json")
+            if os.path.exists(final_file):
+                with open(final_file, 'r', encoding='utf-8') as f:
+                    auth_data = json.load(f)
+                phone = auth_data.get('phone')
+                api_id = int(auth_data.get('api_id'))
+                api_hash = auth_data.get('api_hash')
+                session_base = auth_data.get('session_path')  # without .session
+                src_session = f"{session_base}.session" if session_base else None
+                # Copy session to user-specific path
+                dest_session = self.get_user_session_path(user_id, phone)
+                os.makedirs(os.path.dirname(dest_session), exist_ok=True)
+                if src_session and os.path.exists(src_session):
+                    try:
+                        shutil.copy(src_session, dest_session)
+                    except Exception as e:
+                        logger.warning(f"Failed copying session file: {e}")
+                # Build account dict
+                account = {
+                    'phone': phone,
+                    'api_id': api_id,
+                    'api_hash': api_hash,
+                    'active': True,
+                    'first_name': phone
+                }
+                # Try to fetch first_name
+                try:
+                    client = TelegramClient(dest_session, api_id, api_hash)
+                    await client.connect()
+                    me = await client.get_me()
+                    if me and getattr(me, 'first_name', None):
+                        account['first_name'] = me.first_name
+                finally:
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
+                self.add_user_account(user_id, account)
+                # Cleanup temp files
+                try:
+                    os.remove(final_file)
+                except:
+                    pass
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                # Confirm to user
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👤 حساباتي", callback_data="user_accounts")],
+                    [InlineKeyboardButton("🏠 الرئيسية", callback_data="back_main")]
+                ])
+                await query.edit_message_text(
+                    "✅ تم إضافة الحساب بنجاح!\nيمكنك إدارة حساباتك من قائمة \"حساباتي\".",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb
+                )
+                return
+            elif os.path.exists(temp_file):
+                public_url = self.get_public_url()
+                web_url = f"https://{public_url}/auth/{user_id}"
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌐 فتح صفحة الويب", url=web_url)],
+                    [InlineKeyboardButton("🔄 تحقق من الحالة", callback_data="check_web_auth")],
+                    [InlineKeyboardButton("🔙 رجوع", callback_data="user_settings")]
+                ])
+                await query.edit_message_text(
+                    "⌛ عملية المصادقة قيد الانتظار.\n"
+                    "أدخل الكود في الصفحة ثم اضغط \"تحقق من الحالة\".",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb
+                )
+                return
+            else:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account")],
+                    [InlineKeyboardButton("🔙 رجوع", callback_data="user_settings")]
+                ])
+                await query.edit_message_text(
+                    "ℹ️ لا توجد عملية مصادقة جارية.\nابدأ إضافة حساب جديد.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb
+                )
+                return
+        except Exception as e:
+            logger.error(f"check_auth_status error: {e}")
+            await query.edit_message_text(f"❌ خطأ أثناء التحقق: {e}")
+            return
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """إظهار الحالة عبر الأمر /status"""
+        user_id = update.effective_user.id
+        status_text = self.get_status_text(user_id)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 الرئيسية", callback_data="back_main")]])
+        await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages from users"""
@@ -1594,8 +1802,10 @@ class TelegramSniper:
         
         # Add handlers
         application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("status", self.status_command))
         application.add_handler(CallbackQueryHandler(self.button_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), self.document_handler))
 
         # Global error handler
         application.add_error_handler(self.error_handler)
@@ -1655,7 +1865,7 @@ if __name__ == "__main__":
     # Start bot only (Web app runs separately on PythonAnywhere)
     try:
         bot = TelegramSniper()
-        bot.public_url = "upbeat-simplicity-production.up.railway.app"  # Railway hosting
+        bot.public_url = "rr-production.up.railway.app"  # Railway hosting
         print("🚀 بوت صيد أسماء المستخدمين بدأ!")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         bot.run_bot()
