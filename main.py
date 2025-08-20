@@ -20,7 +20,7 @@ def run_bot():
         # Get Railway domain from environment or use default
         railway_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN', 'rr-production.up.railway.app')
         bot.public_url = railway_url
-        print("🚀 بوت صيد أسماء المستخدمين بدأ!")
+        print("Bot started - بوت صيد أسماء المستخدمين بدأ!")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         print(f"Web URL: https://{railway_url}")
         bot.run_bot()
@@ -28,7 +28,7 @@ def run_bot():
         print(f"Bot error: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Starting Railway service - Bot + Web Server")
+    print("Starting Railway service - Bot + Web Server")
     
     # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
