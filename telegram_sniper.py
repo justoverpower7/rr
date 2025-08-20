@@ -1437,7 +1437,7 @@ class TelegramSniper:
             return self.public_url
         
         # Default PythonAnywhere URL
-        self.public_url = "sirlin12.pythonanywhere.com"
+        self.public_url = "upbeat-simplicity-production.up.railway.app"
         return self.public_url
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1655,7 +1655,7 @@ if __name__ == "__main__":
     # Start bot only (Web app runs separately on PythonAnywhere)
     try:
         bot = TelegramSniper()
-        bot.public_url = "sirlin12.pythonanywhere.com"  # PythonAnywhere hosting
+        bot.public_url = "upbeat-simplicity-production.up.railway.app"  # Railway hosting
         print("🚀 بوت صيد أسماء المستخدمين بدأ!")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         bot.run_bot()
