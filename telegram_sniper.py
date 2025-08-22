@@ -390,6 +390,8 @@ class TelegramSniper:
         self.user_status_msgs: Dict[int, int] = {}  # user_id -> message_id
         self.user_clients: Dict[int, Optional[TelegramClient]] = {}  # track active clients per user
         self.user_cancel_events: Dict[int, asyncio.Event] = {}  # per-user cancellation events
+        # Per-session locks to avoid concurrent SQLite session access
+        self.session_locks: Dict[str, asyncio.Lock] = {}
         self.pending_auth = {}  # المستخدمين في انتظار التحقق
         self.pending_input = {}
         self.pending_replacement = {}
@@ -558,6 +560,14 @@ class TelegramSniper:
                 account.update(updates)
                 break
         self.set_user_prefs(user_id, prefs)
+    
+    def get_session_lock(self, session_base: str) -> asyncio.Lock:
+        """Return a per-session asyncio.Lock to serialize SQLite access for this session file."""
+        lock = self.session_locks.get(session_base)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_base] = lock
+        return lock
     
     async def _cancellable_sleep(self, user_id: int, seconds: float):
         """Sleep in short intervals so stop/cancel signals are respected quickly."""
@@ -1450,27 +1460,39 @@ class TelegramSniper:
         try:
             from telethon import TelegramClient
             session_path = self.get_user_session_path(user_id, account['phone'])
-            # Fallback: if per-user session is missing, try central sessions store
+            # Ensure per-user session exists by copying from central storage if available.
+            # We explicitly avoid using the central session file directly to prevent concurrent SQLite access.
             try:
                 phone_no_plus = account['phone'].replace('+', '')
                 dest_session_file = f"{session_path}.session"
                 central_base = os.path.join("sessions", f"{user_id}_{phone_no_plus}")
                 central_session_file = f"{central_base}.session"
                 if not os.path.exists(dest_session_file) and os.path.exists(central_session_file):
-                    # Prefer copying into the per-user data dir for consistency
-                    try:
-                        os.makedirs(os.path.dirname(dest_session_file), exist_ok=True)
-                        shutil.copy(central_session_file, dest_session_file)
-                        logger.info(f"Copied session file to user dir: {central_session_file} -> {dest_session_file}")
-                    except Exception as copy_err:
-                        # If copy fails, use the central session directly
-                        logger.warning(f"Failed to copy session to user dir ({copy_err}); using central session directly")
-                        session_path = central_base
+                    os.makedirs(os.path.dirname(dest_session_file), exist_ok=True)
+                    # Retry copy a few times in case the central file is temporarily locked
+                    copy_ok = False
+                    for attempt in range(4):
+                        try:
+                            shutil.copy(central_session_file, dest_session_file)
+                            copy_ok = True
+                            logger.info(f"Copied session file to user dir: {central_session_file} -> {dest_session_file}")
+                            break
+                        except Exception as copy_err:
+                            wait_s = 0.4 * (attempt + 1)
+                            logger.warning(f"Copy attempt {attempt+1} failed for session copy ({copy_err}); retrying in {wait_s:.2f}s")
+                            await asyncio.sleep(wait_s)
+                    if not copy_ok:
+                        # As a safety measure, do not use the central session directly
+                        # to avoid concurrent access. Inform caller by raising.
+                        raise RuntimeError("Unable to copy session file from central store; session may be in use. Please retry.")
                 else:
                     logger.info(f"Using per-user session at {dest_session_file}")
             except Exception as e:
-                # Non-fatal: continue with the original session_path
-                logger.warning(f"Session fallback check failed: {e}")
+                # Non-fatal if dest exists; otherwise propagate
+                dest_session_file = f"{session_path}.session" if session_path else None
+                if not dest_session_file or not os.path.exists(dest_session_file):
+                    raise
+                logger.warning(f"Session preparation warning (continuing): {e}")
             
             # استخدام معرفات طبيعية للفحص
             client = TelegramClient(
@@ -1580,7 +1602,7 @@ class TelegramSniper:
             f"⚡ *إعدادات السرعة*\n\n"
             f"السرعة الحالية: {current_speed}s\n"
             f"🎲 العشوائية: {jitter_label}\n\n"
-            f"⚠️ **تحذير**: السرعات العالية قد تؤدي لحظر مؤقت\n"
+            f"⚠️ **تحذير:** السرعات العالية قد تؤدي لحظر مؤقت\n"
             f"🔹 يُنصح بـ 1.0s أو أكثر للاستخدام الآمن\n\n"
             f"اختر الإعداد المناسب:"
         )
@@ -1660,20 +1682,52 @@ class TelegramSniper:
             # Smart load balancing - rotate between accounts
             current_account_index = 0
             
-            client = await self.get_user_client(user_id, active_accounts[current_account_index])
-            if not client:
-                return
+            # Manage per-session lock for the lifetime of the client
+            current_lock = None
+            # Prepare first client under lock
+            first_account = active_accounts[current_account_index]
+            session_base = self.get_user_session_path(user_id, first_account['phone'])
+            current_lock = self.get_session_lock(session_base)
+            await current_lock.acquire()
             try:
-                await asyncio.wait_for(client.start(), timeout=10)
-            except Exception as e:
-                logger.error(f"start_user_scan: failed to start client for user_id={user_id}: {e}")
-                try:
-                    await context.bot.send_message(user_id, f"❌ فشل بدء الفحص: {e}")
-                except Exception:
-                    pass
-                return
-            # Track active client to allow external stop
-            self.user_clients[user_id] = client
+                client = await self.get_user_client(user_id, first_account)
+                if not client:
+                    current_lock.release()
+                    return
+                # Retry start to avoid transient 'database is locked'
+                start_ok = False
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        await asyncio.wait_for(client.start(), timeout=10)
+                        start_ok = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        msg = str(e).lower()
+                        if 'database is locked' in msg or 'is locked' in msg:
+                            await self._cancellable_sleep(user_id, 0.6 * (attempt + 1))
+                            continue
+                        else:
+                            break
+                if not start_ok:
+                    logger.error(f"start_user_scan: failed to start client for user_id={user_id}: {last_err}")
+                    try:
+                        await context.bot.send_message(user_id, f"❌ فشل بدء الفحص: {last_err}")
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    current_lock.release()
+                    return
+                # Track active client to allow external stop
+                self.user_clients[user_id] = client
+            except Exception:
+                if current_lock and current_lock.locked():
+                    current_lock.release()
+                raise
             msg = await context.bot.send_message(user_id, "🔍 بدء الفحص ...")
             self.user_status_msgs[user_id] = msg.message_id
             try:
@@ -1778,39 +1832,70 @@ class TelegramSniper:
                                         await asyncio.wait_for(client.stop(), timeout=5)
                                     except Exception:
                                         pass
+                                    # small delay to ensure OS releases SQLite handle (especially on Windows)
+                                    await self._cancellable_sleep(user_id, 0.5)
+                                    if current_lock and current_lock.locked():
+                                        current_lock.release()
                                     # تحقّق سريع من إشارة الإيقاف قبل بدء عميل جديد
                                     prefs = self.get_user_prefs(user_id)
                                     if not prefs.get('running', True):
                                         break
-                                    client = await self.get_user_client(user_id, active_accounts[current_account_index])
-                                    try:
-                                        await asyncio.wait_for(client.start(), timeout=10)
-                                    except Exception as e:
-                                        logger.error(f"scan_user_task: failed to rotate/start client for user_id={user_id}: {e}")
+                                    # Acquire new session lock for next account
+                                    next_account = active_accounts[current_account_index]
+                                    session_base = self.get_user_session_path(user_id, next_account['phone'])
+                                    current_lock = self.get_session_lock(session_base)
+                                    await current_lock.acquire()
+                                    client = await self.get_user_client(user_id, next_account)
+                                    # Retry start with backoff on locked db
+                                    start_ok = False
+                                    last_err = None
+                                    for attempt in range(3):
                                         try:
-                                            await context.bot.send_message(user_id, f"❌ فشل تبديل الحساب/بدء الجلسة: {e}")
+                                            await asyncio.wait_for(client.start(), timeout=10)
+                                            start_ok = True
+                                            break
+                                        except Exception as e:
+                                            last_err = e
+                                            msg = str(e).lower()
+                                            if 'database is locked' in msg or 'is locked' in msg:
+                                                await self._cancellable_sleep(user_id, 0.6 * (attempt + 1))
+                                                continue
+                                            else:
+                                                break
+                                    if not start_ok:
+                                        logger.error(f"scan_user_task: failed to rotate/start client for user_id={user_id}: {last_err}")
+                                        try:
+                                            await context.bot.send_message(user_id, f"❌ فشل تبديل الحساب/بدء الجلسة: {last_err}")
                                         except Exception:
                                             pass
+                                        # Release lock if failed
+                                        if current_lock and current_lock.locked():
+                                            current_lock.release()
                                         break
                                     # Update tracked client
                                     self.user_clients[user_id] = client
-                            else:
-                                # وضع الإشعار - إرسال إشعار فقط
-                                type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
-                                await context.bot.send_message(user_id, f"🔔 {type_text} متاح: @{username}")
+                        else:
+                            # وضع الإشعار - إرسال إشعار فقط
+                            type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
+                            await context.bot.send_message(user_id, f"🔔 {type_text} متاح: @{username}")
                         # استخدام سرعة المستخدم مع تأخير عشوائي اختياري للأمان
+                        prefs = self.get_user_prefs(user_id)  # re-read to apply dynamic changes immediately
                         base_delay = prefs.get('speed_delay', 5)
                         jitter_on = prefs.get('jitter', True)
                         random_delay = __import__('random').uniform(1, 3) if jitter_on else 0.0  # تأخير عشوائي 1-3 ثانية
                         total_delay = base_delay + random_delay
+                        logger.debug(f"Delay applied (base={base_delay}, jitter_on={jitter_on}, rnd={random_delay:.2f}) total={total_delay:.2f}s")
                         await self._cancellable_sleep(user_id, total_delay)
             except asyncio.CancelledError:
                 pass
             finally:
+                # Ensure client stopped and session lock released
                 try:
                     await asyncio.wait_for(client.stop(), timeout=5)
                 except Exception:
                     pass
+                if current_lock and current_lock.locked():
+                    current_lock.release()
                 logger.info(f"scan_user_task: client stopped and task finishing for user_id={user_id}")
                 # Update UI message to reflect stop
                 try:
