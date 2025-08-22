@@ -859,11 +859,7 @@ class TelegramSniper:
         prefs['add_mode'] = False
         self.set_user_prefs(user_id, prefs)
         
-        # ابدأ الفحص تلقائياً إذا كان متوقفاً
-        if not prefs.get('running', False):
-            prefs['running'] = True
-            self.set_user_prefs(user_id, prefs)
-            await self.start_user_scan(user_id, context)
+        # تم تعطيل البدء التلقائي للفحص بناءً على طلب المستخدم
 
     async def handle_username_replacement(self, update, context, user_id, message_text):
         """معالجة استبدال اليوزرات"""
@@ -1077,6 +1073,15 @@ class TelegramSniper:
             )
             return
         
+        elif data == "start_usernames_notify":
+            active_users = await self.start_all_checkers(update, context, claim_mode=False, scan_type='users')
+            await query.edit_message_text(
+                "🔔 *تم تشغيل إشعارات اليوزرات!*\n"
+                f"المستخدمون النشطون: {active_users}\n"
+                f"🔍 بدأ فحص اليوزرات مع إشعارات فقط!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
         elif data == "start_channels_notify":
             active_users = await self.start_all_checkers(update, context, claim_mode=False, scan_type='channels')
             await query.edit_message_text(
@@ -1775,11 +1780,7 @@ class TelegramSniper:
                 prefs['add_mode'] = False
                 self.set_user_prefs(user_id, prefs)
                 
-                # ابدأ الفحص تلقائياً إذا كان متوقفاً
-                if not prefs.get('running', False):
-                    prefs['running'] = True
-                    self.set_user_prefs(user_id, prefs)
-                    await self.start_user_scan(user_id, context)
+                # تم تعطيل البدء التلقائي للفحص بناءً على طلب المستخدم
 
     async def document_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle .txt files containing usernames or channel links."""
@@ -1804,10 +1805,7 @@ class TelegramSniper:
             await update.message.reply_text(
                 f"✅ تم إضافة {len(new_usernames)} اسم من الملف\nالإجمالي الآن: {len(all_usernames)} اسم"
             )
-            if not prefs.get('running', False):
-                prefs['running'] = True
-                self.set_user_prefs(user_id, prefs)
-                await self.start_user_scan(user_id, context)
+            # تم تعطيل البدء التلقائي للفحص بناءً على طلب المستخدم
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         from telegram.error import BadRequest
