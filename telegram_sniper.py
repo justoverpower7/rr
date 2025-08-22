@@ -1129,6 +1129,10 @@ class TelegramSniper:
                 parse_mode=ParseMode.MARKDOWN
             )
         
+        elif data == "check_web_auth":
+            # Verify whether the user has completed the web authentication flow
+            await self.check_auth_status(query, context, user_id)
+            return
         elif data == "status":
             status_text = self.get_status_text(user_id)
             await query.edit_message_text(
