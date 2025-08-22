@@ -42,6 +42,46 @@ if sys.platform == 'win32':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 logger = logging.getLogger(__name__)
 
+# ---- Helpers: phone and digits normalization ----
+def to_ascii_digits(s: str) -> str:
+    """Convert Arabic-Indic digits to ASCII digits."""
+    try:
+        s = str(s)
+    except Exception:
+        s = ''
+    # Arabic-Indic (U+0660–U+0669) and Eastern Arabic-Indic (U+06F0–U+06F9)
+    arabic = "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹"
+    western = "01234567890123456789"
+    return s.translate(str.maketrans(arabic, western))
+
+def normalize_digits_only(raw: str) -> str:
+    """Keep only ASCII digits from the input, converting Arabic numerals first."""
+    s = to_ascii_digits(raw).strip()
+    return re.sub(r'\D+', '', s)
+
+def normalize_phone(raw: str) -> str:
+    """Normalize phone string to a clean form acceptable by Telegram.
+    - Convert Arabic numerals to ASCII
+    - Remove spaces, dashes, dots, parentheses, NBSP and RTL/LTR marks
+    - Convert leading 00 to +
+    - Ensure at most a single leading +
+    """
+    s = to_ascii_digits(raw).strip()
+    # Remove common formatting and invisible marks
+    s = re.sub(r'[\s\-\.\(\)\u00A0\u200e\u200f]+', '', s)
+    leading_plus = False
+    if s.startswith('00'):
+        s = s[2:]
+        leading_plus = True
+    if s.startswith('+'):
+        leading_plus = True
+        s = s[1:]
+    # Remove any non-digits leftover
+    s = re.sub(r'[^0-9]', '', s)
+    if leading_plus:
+        s = '+' + s
+    return s
+
 # Flask Web App للمصادقة
 app = Flask(__name__)
 
@@ -58,10 +98,12 @@ def submit_auth():
     try:
         data = request.get_json(silent=True) or {}
         user_id = str(data.get('user_id', '')).strip()
-        phone = str(data.get('phone', '')).strip()
-        api_id_str = str(data.get('api_id', '')).strip()
+        raw_phone = str(data.get('phone', '')).strip()
+        phone = normalize_phone(raw_phone)
+        api_id_str_raw = str(data.get('api_id', '')).strip()
+        api_id_str = normalize_digits_only(api_id_str_raw)
         api_hash = str(data.get('api_hash', '')).strip()
-        code = str(data.get('code', '')).strip()
+        code = normalize_digits_only(str(data.get('code', '')).strip())
 
         if not all([user_id, phone, api_id_str, api_hash, code]):
             return jsonify({'success': False, 'error': 'جميع الحقول مطلوبة'})
@@ -94,10 +136,12 @@ def submit_auth():
         temp_pch = temp_data.get('phone_code_hash')
         if not temp_pch:
             return jsonify({'success': False, 'error': 'انتهت صلاحية الجلسة. أعد طلب الكود'})
-        # If present, enforce matching phone/api credentials
-        if temp_data.get('phone') and temp_data.get('phone') != phone:
+        # If present, enforce matching phone/api credentials (normalize before compare)
+        saved_phone = normalize_phone(str(temp_data.get('phone', '')))
+        if saved_phone and saved_phone != phone:
             return jsonify({'success': False, 'error': 'رقم الهاتف لا يطابق الطلب السابق'})
-        if str(temp_data.get('api_id', '')) and int(temp_data.get('api_id')) != api_id_int:
+        saved_api_id_str = normalize_digits_only(str(temp_data.get('api_id', '')))
+        if saved_api_id_str and int(saved_api_id_str) != api_id_int:
             return jsonify({'success': False, 'error': 'API ID لا يطابق الطلب السابق'})
         if temp_data.get('api_hash') and temp_data.get('api_hash') != api_hash:
             return jsonify({'success': False, 'error': 'API HASH لا يطابق الطلب السابق'})
@@ -223,8 +267,10 @@ def request_code():
     try:
         data = request.get_json(silent=True) or {}
         user_id = str(data.get('user_id', '')).strip()
-        phone = str(data.get('phone', '')).strip()
-        api_id_str = str(data.get('api_id', '')).strip()
+        raw_phone = str(data.get('phone', '')).strip()
+        phone = normalize_phone(raw_phone)
+        api_id_str_raw = str(data.get('api_id', '')).strip()
+        api_id_str = normalize_digits_only(api_id_str_raw)
         api_hash = str(data.get('api_hash', '')).strip()
 
         if not all([user_id, phone, api_id_str, api_hash]):
@@ -293,7 +339,7 @@ def request_code():
                 temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
                 temp_data = {
                     'phone_code_hash': result.phone_code_hash,
-                    'phone': phone,
+                    'phone': phone,  # normalized
                     'api_id': api_id,
                     'api_hash': api_hash,
                     'timestamp': datetime.now().isoformat()
