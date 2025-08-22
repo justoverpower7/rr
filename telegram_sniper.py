@@ -18,6 +18,7 @@ from telethon import functions
 from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
 from telethon.errors.rpcerrorlist import UsernameNotOccupiedError, UsernameInvalidError, FloodWaitError
 import logging
+import re
 import requests
 from pyrogram import Client
 from pyrogram.errors import FloodWait, UsernameOccupied, UsernameInvalid
@@ -55,15 +56,28 @@ def auth_page(user_id):
 @app.route('/submit_auth', methods=['POST'])
 def submit_auth():
     try:
-        data = request.json
-        user_id = data.get('user_id')
-        phone = data.get('phone')
-        api_id = data.get('api_id')
-        api_hash = data.get('api_hash')
-        code = data.get('code')
-        
-        if not all([user_id, phone, api_id, api_hash, code]):
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '')).strip()
+        phone = str(data.get('phone', '')).strip()
+        api_id_str = str(data.get('api_id', '')).strip()
+        api_hash = str(data.get('api_hash', '')).strip()
+        code = str(data.get('code', '')).strip()
+
+        if not all([user_id, phone, api_id_str, api_hash, code]):
             return jsonify({'success': False, 'error': 'جميع الحقول مطلوبة'})
+
+        # Basic server-side validation
+        if not re.fullmatch(r'\+?[0-9]{7,15}', phone):
+            return jsonify({'success': False, 'error': 'رقم الهاتف غير صالح'})
+        if not api_id_str.isdigit():
+            return jsonify({'success': False, 'error': 'API ID غير صالح'})
+        api_id_int = int(api_id_str)
+        if api_id_int <= 0:
+            return jsonify({'success': False, 'error': 'API ID غير صالح'})
+        if not re.fullmatch(r'[A-Za-z0-9]{32}', api_hash):
+            return jsonify({'success': False, 'error': 'API HASH غير صالح'})
+        if not re.fullmatch(r'[0-9]{3,8}', code):
+            return jsonify({'success': False, 'error': 'كود التحقق غير صالح'})
         
         # قراءة phone_code_hash من الملف المؤقت
         temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
@@ -73,8 +87,20 @@ def submit_auth():
         try:
             with open(temp_file, 'r', encoding='utf-8') as f:
                 temp_data = json.load(f)
-        except:
+        except Exception:
             return jsonify({'success': False, 'error': 'خطأ في قراءة بيانات الجلسة'})
+
+        # Ensure temp data is consistent with request
+        temp_pch = temp_data.get('phone_code_hash')
+        if not temp_pch:
+            return jsonify({'success': False, 'error': 'انتهت صلاحية الجلسة. أعد طلب الكود'})
+        # If present, enforce matching phone/api credentials
+        if temp_data.get('phone') and temp_data.get('phone') != phone:
+            return jsonify({'success': False, 'error': 'رقم الهاتف لا يطابق الطلب السابق'})
+        if str(temp_data.get('api_id', '')) and int(temp_data.get('api_id')) != api_id_int:
+            return jsonify({'success': False, 'error': 'API ID لا يطابق الطلب السابق'})
+        if temp_data.get('api_hash') and temp_data.get('api_hash') != api_hash:
+            return jsonify({'success': False, 'error': 'API HASH لا يطابق الطلب السابق'})
         
         # محاولة تسجيل الدخول
         async def verify_code():
@@ -87,7 +113,7 @@ def submit_auth():
             # نفس المعرفات المستخدمة في طلب الكود
             client = TelegramClient(
                 session_path,
-                int(api_id),
+                api_id_int,
                 api_hash,
                 device_model="Samsung SM-G973F",
                 system_version="Android 11",
@@ -106,7 +132,7 @@ def submit_auth():
                 await client.sign_in(
                     phone=phone,
                     code=code,
-                    phone_code_hash=temp_data['phone_code_hash']
+                    phone_code_hash=temp_pch
                 )
                 
                 # إنشاء session دائم
@@ -162,9 +188,8 @@ def submit_auth():
             auth_data = {
                 'user_id': user_id,
                 'phone': phone,
-                'api_id': int(api_id),
+                'api_id': api_id_int,
                 'api_hash': api_hash,
-                'code': code,
                 'timestamp': datetime.now().isoformat(),
                 'status': 'completed',
                 'session_path': f"sessions/{user_id}_{phone.replace('+', '')}"
@@ -177,6 +202,13 @@ def submit_auth():
             # حذف الملف المؤقت
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+            # Cleanup temp session file
+            try:
+                temp_session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}.session"
+                if os.path.exists(temp_session_path):
+                    os.remove(temp_session_path)
+            except Exception:
+                pass
                 
             return jsonify({'success': True, 'message': 'تم إضافة الحساب بنجاح!'})
         else:
@@ -189,14 +221,43 @@ def submit_auth():
 def request_code():
     """طلب كود التحقق"""
     try:
-        data = request.json
-        user_id = data.get('user_id')
-        phone = data.get('phone') 
-        api_id = int(data.get('api_id'))
-        api_hash = data.get('api_hash')
-        
-        if not all([user_id, phone, api_id, api_hash]):
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', '')).strip()
+        phone = str(data.get('phone', '')).strip()
+        api_id_str = str(data.get('api_id', '')).strip()
+        api_hash = str(data.get('api_hash', '')).strip()
+
+        if not all([user_id, phone, api_id_str, api_hash]):
             return jsonify({'success': False, 'error': 'جميع الحقول مطلوبة'})
+
+        import re
+        if not re.fullmatch(r'\+?[0-9]{7,15}', phone):
+            return jsonify({'success': False, 'error': 'رقم الهاتف غير صالح'})
+        if not api_id_str.isdigit():
+            return jsonify({'success': False, 'error': 'API ID غير صالح'})
+        api_id = int(api_id_str)
+        if api_id <= 0:
+            return jsonify({'success': False, 'error': 'API ID غير صالح'})
+        if not re.fullmatch(r'[A-Za-z0-9]{32}', api_hash):
+            return jsonify({'success': False, 'error': 'API HASH غير صالح'})
+
+        # Simple throttle by previous temp request timestamp
+        os.makedirs("temp_auth", exist_ok=True)
+        temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+        try:
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    old = json.load(f)
+                ts = old.get('timestamp')
+                if ts:
+                    try:
+                        delta = (datetime.now() - datetime.fromisoformat(ts)).total_seconds()
+                        if delta < 30:
+                            return jsonify({'success': False, 'error': 'الرجاء الانتظار قبل طلب كود جديد'})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         
         # دالة async لطلب الكود
         async def send_code():
@@ -227,14 +288,17 @@ def request_code():
                 await asyncio.sleep(__import__('random').uniform(1, 3))
                 result = await client.send_code_request(phone)
                 
-                # حفظ phone_code_hash مؤقتاً
+                # حفظ phone_code_hash مؤقتاً مع ربط الطلب بالهاتف و API
                 os.makedirs("temp_auth", exist_ok=True)
                 temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
                 temp_data = {
                     'phone_code_hash': result.phone_code_hash,
+                    'phone': phone,
+                    'api_id': api_id,
+                    'api_hash': api_hash,
                     'timestamp': datetime.now().isoformat()
                 }
-                
+
                 with open(temp_file, 'w', encoding='utf-8') as f:
                     json.dump(temp_data, f, ensure_ascii=False, indent=2)
                 
@@ -279,6 +343,7 @@ class TelegramSniper:
         self.user_tasks: Dict[int, asyncio.Task] = {}
         self.user_status_msgs: Dict[int, int] = {}  # user_id -> message_id
         self.user_clients: Dict[int, Optional[TelegramClient]] = {}  # track active clients per user
+        self.user_cancel_events: Dict[int, asyncio.Event] = {}  # per-user cancellation events
         self.pending_auth = {}  # المستخدمين في انتظار التحقق
         self.pending_input = {}
         self.pending_replacement = {}
@@ -368,6 +433,7 @@ class TelegramSniper:
             'replace_mode': False,
             'add_mode': False,
             'speed_delay': 5,  # التأخير بين العمليات بالثواني (زيادة للأمان)
+            'jitter': True,    # تفعيل تأخير عشوائي إضافي للأمان
             'accounts': []  # قائمة حسابات المستخدم
         }
     
@@ -461,6 +527,10 @@ class TelegramSniper:
             # stop early if user pressed stop
             prefs = self.get_user_prefs(user_id)
             if not prefs.get('running', True):
+                return
+            # also stop if cancellation event set
+            evt = self.user_cancel_events.get(user_id)
+            if evt and evt.is_set():
                 return
             try:
                 await asyncio.sleep(min(0.25, end - now))
@@ -567,8 +637,19 @@ class TelegramSniper:
         except asyncio.CancelledError:
             # Propagate cancellation so the scan loop exits immediately
             raise
+        except ValueError as e:
+            # Telethon may raise ValueError("No user has 'xxx' as username") for missing usernames
+            msg = str(e)
+            if 'no user has' in msg.lower():
+                return True, "متاح"
+            return False, f"خطأ: {msg[:50]}..."
         except Exception as e:
-            return False, f"خطأ: {str(e)[:50]}..."
+            # Treat known 'not occupied' wordings as available
+            msg = str(e)
+            lower = msg.lower()
+            if 'nobody is using this username' in lower or 'username not occupied' in lower:
+                return True, "متاح"
+            return False, f"خطأ: {msg[:50]}..."
     
     async def claim_username(self, client: TelegramClient, username: str, operation_type: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
         """Attempt to claim available username using Telethon"""
@@ -618,6 +699,12 @@ class TelegramSniper:
         try:
             await client.start()
             logger.info(f"Client started for {list_name}")
+            
+            # Admin/global speed control (optional via file 'admin_speed')
+            try:
+                admin_speed = float(self.read_file('admin_speed', '1.5'))
+            except Exception:
+                admin_speed = 1.5
             
             # Get operation type
             operation_type = self.config['types'].get(list_name, 'c')
@@ -681,12 +768,13 @@ class TelegramSniper:
                             logger.warning(f"Flood wait {wait_time}s for {list_name}")
                             await asyncio.sleep(wait_time)
                         
-                        await asyncio.sleep(1.5)                       
+                        # احترام سرعة الفحص العامة مع عشوائية بسيطة
+                        await asyncio.sleep(admin_speed + __import__('random').uniform(0.5, 1.5))                       
                     except Exception as e:
                         logger.error(f"Error processing @{username} on {list_name}: {e}")
                         await asyncio.sleep(5)
                 
-                await asyncio.sleep(10)  # Cycle delay
+                await asyncio.sleep(max(10, admin_speed * 5))  # Cycle delay
                 
         except Exception as e:
             error_msg = f"❌ Critical error in {list_name}: {str(e)}"
@@ -714,6 +802,7 @@ class TelegramSniper:
             [InlineKeyboardButton("👤 فحص يوزرات", callback_data="mode_users"),
              InlineKeyboardButton("📺 فحص قنوات", callback_data="mode_channels")],
             [InlineKeyboardButton("➕ إضافة أسماء", callback_data="add_names")],
+            [InlineKeyboardButton("⚡ السرعة", callback_data="speed_settings")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]
         ]
         text = (
@@ -1214,6 +1303,11 @@ class TelegramSniper:
             await self.user_settings_command(query, context)
             return
         
+        elif data == "speed_settings":
+            # عرض قائمة إعدادات السرعة
+            await self.show_speed_settings(user_id, query, context)
+            return
+        
         elif data == "add_account":
             # إضافة حساب جديد عبر Web App
             web_url = f"https://{self.get_public_url()}/auth/{user_id}"
@@ -1261,6 +1355,18 @@ class TelegramSniper:
             prefs['speed_delay'] = speed
             self.set_user_prefs(user_id, prefs)
             await query.answer(f"✅ تم تعيين السرعة إلى {speed} ثانية", show_alert=True)
+            await self.show_speed_settings(user_id, update, context)
+            return
+        
+        elif data == "toggle_jitter":
+            prefs = self.get_user_prefs(user_id)
+            prefs['jitter'] = not prefs.get('jitter', True)
+            self.set_user_prefs(user_id, prefs)
+            try:
+                state = "مفعّلة" if prefs['jitter'] else "متوقفة"
+                await query.answer(f"🎲 العشوائية الآن: {state}", show_alert=False)
+            except Exception:
+                pass
             await self.show_speed_settings(user_id, update, context)
             return
         
@@ -1354,6 +1460,13 @@ class TelegramSniper:
                 self.set_user_prefs(user_id, prefs_tmp)
             except Exception:
                 pass
+            # Signal cancellation event
+            try:
+                evt = self.user_cancel_events.get(user_id)
+                if evt:
+                    evt.set()
+            except Exception:
+                pass
             # Disconnect active client (break any pending network ops)
             client = self.user_clients.get(user_id)
             if client:
@@ -1403,23 +1516,29 @@ class TelegramSniper:
         """عرض إعدادات السرعة"""
         prefs = self.get_user_prefs(user_id)
         current_speed = prefs.get('speed_delay', 1.0)
-        
+        jitter_on = prefs.get('jitter', True)
+        jitter_label = "فعّالة" if jitter_on else "متوقفة"
+
         keyboard = [
+            [InlineKeyboardButton("🚀 فائق (0.5s)", callback_data="set_speed_0.5"),
+             InlineKeyboardButton("⚡ سريع (1.0s)", callback_data="set_speed_1.0")],
             [InlineKeyboardButton("⚖️ متوسط (3.0s)", callback_data="set_speed_3.0"),
-         InlineKeyboardButton("🐌 بطيء (5.0s)", callback_data="set_speed_5.0")],
-        [InlineKeyboardButton("🛡️ آمن (8.0s)", callback_data="set_speed_8.0"),
-         InlineKeyboardButton("🐢 آمن جداً (15.0s)", callback_data="set_speed_15.0")],
+             InlineKeyboardButton("🐌 بطيء (5.0s)", callback_data="set_speed_5.0")],
+            [InlineKeyboardButton("🛡️ آمن (8.0s)", callback_data="set_speed_8.0"),
+             InlineKeyboardButton("🐢 آمن جداً (15.0s)", callback_data="set_speed_15.0")],
+            [InlineKeyboardButton(f"🎲 العشوائية: {jitter_label}", callback_data="toggle_jitter")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="user_settings")]
         ]
-        
+
         text = (
             f"⚡ *إعدادات السرعة*\n\n"
-            f"السرعة الحالية: {current_speed}s\n\n"
+            f"السرعة الحالية: {current_speed}s\n"
+            f"🎲 العشوائية: {jitter_label}\n\n"
             f"⚠️ **تحذير**: السرعات العالية قد تؤدي لحظر مؤقت\n"
             f"🔹 يُنصح بـ 1.0s أو أكثر للاستخدام الآمن\n\n"
-            f"اختر السرعة المناسبة:"
+            f"اختر الإعداد المناسب:"
         )
-        
+
         if hasattr(update, 'edit_message_text'):
             await update.edit_message_text(
                 text,
@@ -1445,6 +1564,13 @@ class TelegramSniper:
                 self.set_user_prefs(user_id, prefs)
             except Exception:
                 pass
+            # Signal cancellation event for this user
+            try:
+                evt = self.user_cancel_events.get(user_id)
+                if evt:
+                    evt.set()
+            except Exception:
+                pass
             client = self.user_clients.get(user_id)
             if client:
                 try:
@@ -1461,6 +1587,7 @@ class TelegramSniper:
         
         self.user_tasks.clear()
         self.user_clients.clear()
+        self.user_cancel_events.clear()
         logger.info("Stopped all user checkers")
     
     async def start_user_scan(self, user_id: int, context):
@@ -1469,6 +1596,13 @@ class TelegramSniper:
         async def scan_user_task():
             prefs = self.get_user_prefs(user_id)
             user_accounts = self.get_user_accounts(user_id)
+            # Setup/clear cancellation event
+            evt = self.user_cancel_events.get(user_id)
+            if evt:
+                evt.clear()
+            else:
+                evt = asyncio.Event()
+                self.user_cancel_events[user_id] = evt
             
             # Filter active accounts
             active_accounts = [acc for acc in user_accounts if acc.get('active', True)]
@@ -1499,6 +1633,11 @@ class TelegramSniper:
             try:
                 logger.info(f"scan_user_task: client started, entering loop for user_id={user_id}")
                 while True:
+                    # Fast path: cancel event
+                    evt_local = self.user_cancel_events.get(user_id)
+                    if evt_local and evt_local.is_set():
+                        logger.info(f"scan_user_task: cancel event set, exiting for user_id={user_id}")
+                        break
                     prefs = self.get_user_prefs(user_id)
                     if not prefs.get('running', True):
                         logger.info(f"scan_user_task: running flag set to False, exiting for user_id={user_id}")
@@ -1516,6 +1655,9 @@ class TelegramSniper:
                     total = len(usernames)
                     for idx, username in enumerate(usernames, 1):
                         # تحقق من إشارة التوقف بسرعة داخل الحلقة
+                        evt_local = self.user_cancel_events.get(user_id)
+                        if evt_local and evt_local.is_set():
+                            break
                         prefs = self.get_user_prefs(user_id)
                         if not prefs.get('running', True):
                             break
@@ -1523,7 +1665,10 @@ class TelegramSniper:
                         # عرض حالة الفحص
                         checking_text = f"🔍 {idx}/{total} • {percent}%\nجاري فحص: @{username}..."
                         try:
-                            await context.bot.edit_message_text(checking_text, chat_id=user_id, message_id=msg.message_id)
+                            await asyncio.wait_for(
+                                context.bot.edit_message_text(checking_text, chat_id=user_id, message_id=msg.message_id),
+                                timeout=5
+                            )
                         except Exception:
                             pass
                         
@@ -1538,7 +1683,10 @@ class TelegramSniper:
                         # عرض النتيجة
                         result_text = f"🔍 {idx}/{total} • {percent}%\n@{username} → {status}"
                         try:
-                            await context.bot.edit_message_text(result_text, chat_id=user_id, message_id=msg.message_id)
+                            await asyncio.wait_for(
+                                context.bot.edit_message_text(result_text, chat_id=user_id, message_id=msg.message_id),
+                                timeout=5
+                            )
                         except Exception:
                             pass
                         if is_available:
@@ -1547,6 +1695,9 @@ class TelegramSniper:
                                 # تحقق سريع من إشارة الإيقاف قبل محاولة الحجز
                                 prefs = self.get_user_prefs(user_id)
                                 if not prefs.get('running', True):
+                                    break
+                                evt_local = self.user_cancel_events.get(user_id)
+                                if evt_local and evt_local.is_set():
                                     break
                                 # وضع الحجز - محاولة حجز اليوزر
                                 op_type = 'c' if user_mode == 'channels' else 'a'
@@ -1601,9 +1752,10 @@ class TelegramSniper:
                                 # وضع الإشعار - إرسال إشعار فقط
                                 type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
                                 await context.bot.send_message(user_id, f"🔔 {type_text} متاح: @{username}")
-                        # استخدام سرعة المستخدم مع تأخير عشوائي إضافي للأمان
+                        # استخدام سرعة المستخدم مع تأخير عشوائي اختياري للأمان
                         base_delay = prefs.get('speed_delay', 5)
-                        random_delay = __import__('random').uniform(1, 3)  # تأخير عشوائي 1-3 ثانية
+                        jitter_on = prefs.get('jitter', True)
+                        random_delay = __import__('random').uniform(1, 3) if jitter_on else 0.0  # تأخير عشوائي 1-3 ثانية
                         total_delay = base_delay + random_delay
                         await self._cancellable_sleep(user_id, total_delay)
             except asyncio.CancelledError:
@@ -1616,7 +1768,10 @@ class TelegramSniper:
                 logger.info(f"scan_user_task: client stopped and task finishing for user_id={user_id}")
                 # Update UI message to reflect stop
                 try:
-                    await context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=msg.message_id)
+                    await asyncio.wait_for(
+                        context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=msg.message_id),
+                        timeout=5
+                    )
                 except Exception:
                     pass
                 self.user_clients.pop(user_id, None)
@@ -1898,35 +2053,78 @@ class TelegramSniper:
     async def document_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle .txt files containing usernames or channel links."""
         user_id = update.effective_user.id
+        # Validate document before download
+        doc = update.message.document
+        try:
+            file_size = getattr(doc, 'file_size', 0) or 0
+            file_name = getattr(doc, 'file_name', '') or ''
+            if file_size > 2_000_000:
+                await update.message.reply_text("⚠️ الملف كبير جداً (>2MB). الرجاء تقسيمه ورفع ملف أصغر.")
+                return
+            if file_name and not file_name.lower().endswith('.txt'):
+                await update.message.reply_text("❌ يُسمح فقط بملفات .txt")
+                return
+        except Exception:
+            pass
         # download file
         file = await context.bot.get_file(update.message.document.file_id)
         path = await file.download_to_drive()
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [l.strip() for l in f if l.strip()]
-        import re
-        text = '\n'.join(lines)
-        usernames = re.findall(r'(?:https?://t\.me/)?@?([a-zA-Z0-9_]{5,32})', text)
+        usernames = []
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                # Limit to avoid excessive processing
+                lines = []
+                for i, l in enumerate(f):
+                    if i >= 20000:
+                        break
+                    l = l.strip()
+                    if l:
+                        lines.append(l)
+            import re
+            text = '\n'.join(lines)
+            usernames = re.findall(r'(?:https?://t\.me/)?@?([a-zA-Z0-9_]{5,32})', text)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
         if not usernames:
             await update.message.reply_text("⚠️ لم يتم العثور على أي معرفات صالحة داخل الملف")
             return
         prefs = self.get_user_prefs(user_id)
-        current_usernames = self.get_user_list(user_id)
-        new_usernames = [u for u in usernames if u not in current_usernames]
-        if new_usernames:
-            all_usernames = current_usernames + new_usernames
-            self.write_user_list(user_id, all_usernames)
-            await update.message.reply_text(
-                f"✅ تم إضافة {len(new_usernames)} اسم من الملف\nالإجمالي الآن: {len(all_usernames)} اسم"
-            )
+        user_mode = prefs.get('mode', 'users')
+        if user_mode == 'channels':
+            current_items = self.get_user_channels(user_id)
+            new_items = [u for u in usernames if u not in current_items]
+            if new_items:
+                all_items = current_items + new_items
+                self.write_user_channels(user_id, all_items)
+                await update.message.reply_text(
+                    f"✅ تم إضافة {len(new_items)} قناة من الملف\nالإجمالي الآن: {len(all_items)} قناة"
+                )
+        else:
+            current_items = self.get_user_list(user_id)
+            new_items = [u for u in usernames if u not in current_items]
+            if new_items:
+                all_items = current_items + new_items
+                self.write_user_list(user_id, all_items)
+                await update.message.reply_text(
+                    f"✅ تم إضافة {len(new_items)} اسم من الملف\nالإجمالي الآن: {len(all_items)} اسم"
+                )
             # تم تعطيل البدء التلقائي للفحص بناءً على طلب المستخدم
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         from telegram.error import BadRequest
+        import asyncio
         err = context.error
         # Ignore harmless "message is not modified" errors
         if isinstance(err, BadRequest) and 'message is not modified' in str(err).lower():
             return
-        logger.error(f"Unhandled error: {err}")
+        # Ignore cancellations from our own task stops
+        if isinstance(err, asyncio.CancelledError):
+            return
+        # Log full traceback for easier debugging
+        logger.error(f"Unhandled error: {err}", exc_info=(type(err), err, getattr(err, "__traceback__", None)))
 
     def run_bot(self):
         """Start the Telegram bot"""
@@ -1952,7 +2150,7 @@ class TelegramSniper:
             f"جاهز لصيد الأسماء!"
         )
         
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 def create_default_configs():
     """Create default configuration files if they don't exist"""
