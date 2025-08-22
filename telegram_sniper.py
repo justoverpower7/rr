@@ -1024,35 +1024,30 @@ class TelegramSniper:
                     parse_mode=ParseMode.MARKDOWN
                 )
                 return
-            elif data == "replace_usernames":
-                prefs['mode'] = 'users'
-                prefs['replace_mode'] = True
-                self.set_user_prefs(user_id, prefs)
-                await query.message.reply_text("♻️ *استبدال قائمة اليوزرات*\n\nأرسل اليوزرات الجديدة. ستحل محل القائمة الحالية بالكامل.", parse_mode=ParseMode.MARKDOWN)
-                return
-            elif data == "replace_channels":
-                prefs['mode'] = 'channels'
-                prefs['replace_mode'] = True
-                self.set_user_prefs(user_id, prefs)
-                await query.message.reply_text("♻️ *استبدال قائمة القنوات*\n\nأرسل القنوات الجديدة. ستحل محل القائمة الحالية بالكامل.", parse_mode=ParseMode.MARKDOWN)
-                return
             elif data == "back_settings":
                 # Return to settings menu
                 await self.user_settings_command(update.callback_query, context)
                 return
-
-        # ---------- Admin-only actions control ----------
-        admin_only = {
-            "scan_menu",
-            "scan_usernames_menu",
-            "scan_channels_menu",
-            "start_usernames_claim",
-            "start_channels_notify"
-        }
-        if data in admin_only and user_id != self.config['admin_id']:
-            await query.answer("هذه الميزة للمشرف فقط", show_alert=True)
+        elif data == "replace_usernames":
+            prefs['mode'] = 'users'
+            prefs['replace_mode'] = True
+            self.set_user_prefs(user_id, prefs)
+            await query.message.reply_text(
+                "♻️ *استبدال قائمة اليوزرات*\n\nأرسل اليوزرات الجديدة. ستحل محل القائمة الحالية بالكامل.",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
-        
+        elif data == "replace_channels":
+            prefs['mode'] = 'channels'
+            prefs['replace_mode'] = True
+            self.set_user_prefs(user_id, prefs)
+            await query.message.reply_text(
+                "♻️ *استبدال قائمة القنوات*\n\nأرسل القنوات الجديدة. ستحل محل القائمة الحالية بالكامل.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        # back_settings is handled above inside the user callbacks block
+
         if data == "scan_menu":
             keyboard = [
                 [InlineKeyboardButton("👤 فحص يوزرات", callback_data="scan_usernames_menu"),
@@ -1067,7 +1062,7 @@ class TelegramSniper:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
-        
+
         elif data == "scan_usernames_menu":
             keyboard = [
                 [InlineKeyboardButton("🎯 حجز يوزرات", callback_data="start_usernames_claim"),
@@ -1099,6 +1094,17 @@ class TelegramSniper:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup
             )
+        
+        elif data == "start_channels_claim":
+            logger.info(f"button_handler: user_id={user_id} → start_channels_claim pressed")
+            active_users = await self.start_all_checkers(update, context, claim_mode=True, scan_type='channels')
+            await query.edit_message_text(
+                "🎯 *تم تشغيل حجز القنوات!*\n"
+                f"المستخدمون النشطون: {active_users}\n"
+                f"🔍 بدأ فحص وحجز القنوات!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
         
         elif data == "start_usernames_claim":
             logger.info(f"button_handler: user_id={user_id} → start_usernames_claim pressed")
