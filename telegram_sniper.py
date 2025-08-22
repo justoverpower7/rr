@@ -1298,6 +1298,27 @@ class TelegramSniper:
         try:
             from telethon import TelegramClient
             session_path = self.get_user_session_path(user_id, account['phone'])
+            # Fallback: if per-user session is missing, try central sessions store
+            try:
+                phone_no_plus = account['phone'].replace('+', '')
+                dest_session_file = f"{session_path}.session"
+                central_base = os.path.join("sessions", f"{user_id}_{phone_no_plus}")
+                central_session_file = f"{central_base}.session"
+                if not os.path.exists(dest_session_file) and os.path.exists(central_session_file):
+                    # Prefer copying into the per-user data dir for consistency
+                    try:
+                        os.makedirs(os.path.dirname(dest_session_file), exist_ok=True)
+                        shutil.copy(central_session_file, dest_session_file)
+                        logger.info(f"Copied session file to user dir: {central_session_file} -> {dest_session_file}")
+                    except Exception as copy_err:
+                        # If copy fails, use the central session directly
+                        logger.warning(f"Failed to copy session to user dir ({copy_err}); using central session directly")
+                        session_path = central_base
+                else:
+                    logger.info(f"Using per-user session at {dest_session_file}")
+            except Exception as e:
+                # Non-fatal: continue with the original session_path
+                logger.warning(f"Session fallback check failed: {e}")
             
             # استخدام معرفات طبيعية للفحص
             client = TelegramClient(
@@ -1664,11 +1685,15 @@ class TelegramSniper:
                 dest_session_base = self.get_user_session_path(user_id, phone)
                 dest_session = f"{dest_session_base}.session"
                 os.makedirs(os.path.dirname(dest_session), exist_ok=True)
+                logger.info(f"check_auth_status: src_session={src_session}, dest_session={dest_session}")
                 if src_session and os.path.exists(src_session):
                     try:
                         shutil.copy(src_session, dest_session)
+                        logger.info(f"check_auth_status: copied session -> {dest_session}")
                     except Exception as e:
                         logger.warning(f"Failed copying session file: {e}")
+                else:
+                    logger.warning(f"check_auth_status: source session not found: {src_session}")
                 # Build account dict
                 account = {
                     'phone': phone,
