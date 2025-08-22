@@ -970,14 +970,26 @@ class TelegramSniper:
                         logger.error(f"Error editing add_names submenu: {exc}")
                 return
             elif data == "add_usernames":
+                # Set mode to users and enable add_mode so next text message is processed
                 prefs['mode'] = 'users'
+                prefs['add_mode'] = True
+                prefs['replace_mode'] = False  # ensure other mode disabled
                 self.set_user_prefs(user_id, prefs)
-                await query.message.reply_text("📥 *أرسل الآن اليوزرات.*\nضع كل يوزر في سطر أو أرسل ملف txt.", parse_mode=ParseMode.MARKDOWN)
+                await query.message.reply_text(
+                    "📥 *أرسل الآن اليوزرات.*\nضع كل يوزر في سطر أو أرسل ملف txt.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
                 return
             elif data == "add_channels":
+                # Set mode to channels and enable add_mode so next text message is processed
                 prefs['mode'] = 'channels'
+                prefs['add_mode'] = True
+                prefs['replace_mode'] = False
                 self.set_user_prefs(user_id, prefs)
-                await query.message.reply_text("📥 *أرسل الآن روابط القنوات أو معرفاتها.*\nضع كل قناة في سطر أو أرسل ملف txt.", parse_mode=ParseMode.MARKDOWN)
+                await query.message.reply_text(
+                    "📥 *أرسل الآن روابط القنوات أو معرفاتها.*\nضع كل قناة في سطر أو أرسل ملف txt.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
                 return
             elif data == "replace_usernames":
                 prefs['mode'] = 'users'
