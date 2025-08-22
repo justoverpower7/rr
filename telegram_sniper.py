@@ -478,7 +478,7 @@ class TelegramSniper:
             'mode': 'users',
             'replace_mode': False,
             'add_mode': False,
-            'speed_delay': 5,  # التأخير بين العمليات بالثواني (زيادة للأمان)
+            'speed_delay': 0.5,  # أسرع سرعة افتراضياً
             'jitter': True,    # تفعيل تأخير عشوائي إضافي للأمان
             'accounts': []  # قائمة حسابات المستخدم
         }
@@ -663,8 +663,27 @@ class TelegramSniper:
     async def check_username(self, client: TelegramClient, username: str, operation_type: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
         """Check if username is available using Telethon"""
         try:
-            # If entity resolves, the username exists (occupied)
-            await client.get_entity(username)
+            # Attempt to resolve the username to determine its owner type
+            entity = await client.get_entity(username)
+            try:
+                from telethon.tl.types import User, UserEmpty, Chat, Channel
+            except Exception:
+                # Fallback in case Telethon types are unavailable
+                User = UserEmpty = Chat = Channel = tuple()
+            # Decide availability based on desired operation type ('a' for account, 'c' for channel)
+            if operation_type == 'a':  # looking for account username
+                # Occupied only if taken by a Telegram user/bot; usernames held by channels are acceptable
+                if isinstance(entity, (User,)):
+                    return False, "محتل"
+                else:
+                    return True, "متاح (قناة)"
+            elif operation_type in ['c', 'ch']:  # looking for channel/supergroup username
+                # Occupied only if already taken by a channel/supergroup; usernames held by users are acceptable
+                if isinstance(entity, (Channel, Chat)):
+                    return False, "محتل"
+                else:
+                    return True, "متاح (مستخدم)"
+            # Fallback: treat as occupied if we cannot confidently decide
             return False, "محتل"
         except UsernameNotOccupiedError:
             return True, "متاح"
@@ -759,7 +778,7 @@ class TelegramSniper:
                 usernames = self.get_usernames(list_name)
                 
                 if not usernames:
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(1)  # Very fast cycle for parallel scanning
                     continue
                 
                 for username in usernames:
@@ -1636,196 +1655,6 @@ class TelegramSniper:
         self.user_cancel_events.clear()
         logger.info("Stopped all user checkers")
     
-    async def start_user_scan(self, user_id: int, context):
-        """Start scanning for a specific user using their own accounts"""
-        logger.info(f"start_user_scan: scheduling scan task for user_id={user_id}")
-        async def scan_user_task():
-            prefs = self.get_user_prefs(user_id)
-            user_accounts = self.get_user_accounts(user_id)
-            # Setup/clear cancellation event
-            evt = self.user_cancel_events.get(user_id)
-            if evt:
-                evt.clear()
-            else:
-                evt = asyncio.Event()
-                self.user_cancel_events[user_id] = evt
-            
-            # Filter active accounts
-            active_accounts = [acc for acc in user_accounts if acc.get('active', True)]
-            
-            if not active_accounts:
-                await context.bot.send_message(user_id, "❌ لا توجد حسابات نشطة. يرجى إضافة حساب أو تفعيل حساب موجود")
-                return
-                
-            # Smart load balancing - rotate between accounts
-            current_account_index = 0
-            
-            client = await self.get_user_client(user_id, active_accounts[current_account_index])
-            if not client:
-                return
-            try:
-                await asyncio.wait_for(client.start(), timeout=10)
-            except Exception as e:
-                logger.error(f"start_user_scan: failed to start client for user_id={user_id}: {e}")
-                try:
-                    await context.bot.send_message(user_id, f"❌ فشل بدء الفحص: {e}")
-                except Exception:
-                    pass
-                return
-            # Track active client to allow external stop
-            self.user_clients[user_id] = client
-            msg = await context.bot.send_message(user_id, "🔍 بدء الفحص ...")
-            self.user_status_msgs[user_id] = msg.message_id
-            try:
-                logger.info(f"scan_user_task: client started, entering loop for user_id={user_id}")
-                while True:
-                    # Fast path: cancel event
-                    evt_local = self.user_cancel_events.get(user_id)
-                    if evt_local and evt_local.is_set():
-                        logger.info(f"scan_user_task: cancel event set, exiting for user_id={user_id}")
-                        break
-                    prefs = self.get_user_prefs(user_id)
-                    if not prefs.get('running', True):
-                        logger.info(f"scan_user_task: running flag set to False, exiting for user_id={user_id}")
-                        break
-                    # تحديد نوع القائمة حسب وضع المستخدم
-                    user_mode = prefs.get('mode', 'users')
-                    if user_mode == 'channels':
-                        usernames = self.get_user_channels(user_id)
-                    else:
-                        usernames = self.get_user_list(user_id)
-                        
-                    if not usernames:
-                        await self._cancellable_sleep(user_id, 5)
-                        continue
-                    total = len(usernames)
-                    for idx, username in enumerate(usernames, 1):
-                        # تحقق من إشارة التوقف بسرعة داخل الحلقة
-                        evt_local = self.user_cancel_events.get(user_id)
-                        if evt_local and evt_local.is_set():
-                            break
-                        prefs = self.get_user_prefs(user_id)
-                        if not prefs.get('running', True):
-                            break
-                        percent = int(idx/total*100)
-                        # عرض حالة الفحص
-                        checking_text = f"🔍 {idx}/{total} • {percent}%\nجاري فحص: @{username}..."
-                        try:
-                            await asyncio.wait_for(
-                                context.bot.edit_message_text(checking_text, chat_id=user_id, message_id=msg.message_id),
-                                timeout=5
-                            )
-                        except Exception:
-                            pass
-                        
-                        op_type = 'c' if user_mode == 'channels' else 'a'
-                        try:
-                            is_available, status = await asyncio.wait_for(
-                                self.check_username(client, username, op_type, user_id=user_id), timeout=15
-                            )
-                        except asyncio.TimeoutError:
-                            is_available, status = False, "TIMEOUT"
-                        
-                        # عرض النتيجة
-                        result_text = f"🔍 {idx}/{total} • {percent}%\n@{username} → {status}"
-                        try:
-                            await asyncio.wait_for(
-                                context.bot.edit_message_text(result_text, chat_id=user_id, message_id=msg.message_id),
-                                timeout=5
-                            )
-                        except Exception:
-                            pass
-                        if is_available:
-                            claim_mode = prefs.get('claim_mode', True)
-                            if claim_mode:
-                                # تحقق سريع من إشارة الإيقاف قبل محاولة الحجز
-                                prefs = self.get_user_prefs(user_id)
-                                if not prefs.get('running', True):
-                                    break
-                                evt_local = self.user_cancel_events.get(user_id)
-                                if evt_local and evt_local.is_set():
-                                    break
-                                # وضع الحجز - محاولة حجز اليوزر
-                                op_type = 'c' if user_mode == 'channels' else 'a'
-                                try:
-                                    claimed, _ = await asyncio.wait_for(
-                                        self.claim_username(client, username, op_type, user_id=user_id), timeout=30
-                                    )
-                                except asyncio.TimeoutError:
-                                    claimed = False
-                                if claimed:
-                                    account_name = active_accounts[current_account_index]['first_name']
-                                    await context.bot.send_message(user_id, 
-                                        f"🎉 تم حجز @{username} بنجاح!\n"
-                                        f"👤 باستخدام حساب: {account_name}")
-                                    # حفظ في قائمة اليوزرات المحجوزة
-                                    self.save_claimed_username(user_id, username)
-                                    # حذف من القائمة المناسبة
-                                    if user_mode == 'channels':
-                                        current = self.get_user_channels(user_id)
-                                        if username in current:
-                                            current.remove(username)
-                                            self.write_user_channels(user_id, current)
-                                    else:
-                                        current = self.get_user_list(user_id)
-                                        if username in current:
-                                            current.remove(username)
-                                            self.write_user_list(user_id, current)
-                                            
-                                    # التبديل إلى حساب آخر بعد الحجز لتجنب الحظر
-                                    current_account_index = (current_account_index + 1) % len(active_accounts)
-                                    try:
-                                        await asyncio.wait_for(client.stop(), timeout=5)
-                                    except Exception:
-                                        pass
-                                    # تحقّق سريع من إشارة الإيقاف قبل بدء عميل جديد
-                                    prefs = self.get_user_prefs(user_id)
-                                    if not prefs.get('running', True):
-                                        break
-                                    client = await self.get_user_client(user_id, active_accounts[current_account_index])
-                                    try:
-                                        await asyncio.wait_for(client.start(), timeout=10)
-                                    except Exception as e:
-                                        logger.error(f"scan_user_task: failed to rotate/start client for user_id={user_id}: {e}")
-                                        try:
-                                            await context.bot.send_message(user_id, f"❌ فشل تبديل الحساب/بدء الجلسة: {e}")
-                                        except Exception:
-                                            pass
-                                        break
-                                    # Update tracked client
-                                    self.user_clients[user_id] = client
-                            else:
-                                # وضع الإشعار - إرسال إشعار فقط
-                                type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
-                                await context.bot.send_message(user_id, f"🔔 {type_text} متاح: @{username}")
-                        # استخدام سرعة المستخدم مع تأخير عشوائي اختياري للأمان
-                        base_delay = prefs.get('speed_delay', 5)
-                        jitter_on = prefs.get('jitter', True)
-                        random_delay = __import__('random').uniform(1, 3) if jitter_on else 0.0  # تأخير عشوائي 1-3 ثانية
-                        total_delay = base_delay + random_delay
-                        await self._cancellable_sleep(user_id, total_delay)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                try:
-                    await asyncio.wait_for(client.stop(), timeout=5)
-                except Exception:
-                    pass
-                logger.info(f"scan_user_task: client stopped and task finishing for user_id={user_id}")
-                # Update UI message to reflect stop
-                try:
-                    await asyncio.wait_for(
-                        context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=msg.message_id),
-                        timeout=5
-                    )
-                except Exception:
-                    pass
-                self.user_clients.pop(user_id, None)
-                self.user_tasks.pop(user_id, None)
-        # create task
-        task = asyncio.create_task(scan_user_task())
-        self.user_tasks[user_id] = task
-
     def get_public_url(self):
         """Get public URL for the web app"""
         if self.public_url:
