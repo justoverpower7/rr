@@ -434,7 +434,8 @@ class TelegramSniper:
     def get_user_session_path(self, user_id: int, phone: str) -> str:
         """Get session file path for user account"""
         user_dir = self.get_user_dir(user_id)
-        return os.path.join(user_dir, f"session_{phone.replace('+', '')}.session")
+        # Return BASE session path WITHOUT extension; Telethon appends .session automatically
+        return os.path.join(user_dir, f"session_{phone.replace('+', '')}")
     
     def update_user_account(self, user_id: int, phone: str, updates: Dict):
         """Update specific user account"""
@@ -446,6 +447,26 @@ class TelegramSniper:
                 break
         self.set_user_prefs(user_id, prefs)
     
+    async def _cancellable_sleep(self, user_id: int, seconds: float):
+        """Sleep in short intervals so stop/cancel signals are respected quickly."""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.get_running_loop()
+        end = loop.time() + max(0.0, seconds)
+        while True:
+            now = loop.time()
+            if now >= end:
+                return
+            # stop early if user pressed stop
+            prefs = self.get_user_prefs(user_id)
+            if not prefs.get('running', True):
+                return
+            try:
+                await asyncio.sleep(min(0.25, end - now))
+            except asyncio.CancelledError:
+                # propagate immediate cancellation
+                raise
     def get_user_channels(self, user_id: int) -> List[str]:
         """Get list of channels for user"""
         path = self.user_file_path(user_id, 'channels.txt')
@@ -523,7 +544,7 @@ class TelegramSniper:
         
         return client
     
-    async def check_username(self, client: TelegramClient, username: str, operation_type: str) -> Tuple[bool, str]:
+    async def check_username(self, client: TelegramClient, username: str, operation_type: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
         """Check if username is available using Telethon"""
         try:
             # If entity resolves, the username exists (occupied)
@@ -536,12 +557,20 @@ class TelegramSniper:
         except FloodWaitError as e:
             wait_seconds = getattr(e, 'seconds', 60)
             logger.warning(f"FloodWait for {wait_seconds}s on check_username @{username}")
-            await asyncio.sleep(min(wait_seconds, 300))  # انتظار بحد أقصى 5 دقائق
+            # Respect stop signal if provided
+            total = min(wait_seconds, 300)
+            if user_id is not None and hasattr(self, '_cancellable_sleep'):
+                await self._cancellable_sleep(user_id, total)
+            else:
+                await asyncio.sleep(total)  # fallback
             return False, f"FLOOD_WAIT_{wait_seconds}"
+        except asyncio.CancelledError:
+            # Propagate cancellation so the scan loop exits immediately
+            raise
         except Exception as e:
             return False, f"خطأ: {str(e)[:50]}..."
     
-    async def claim_username(self, client: TelegramClient, username: str, operation_type: str) -> Tuple[bool, str]:
+    async def claim_username(self, client: TelegramClient, username: str, operation_type: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
         """Attempt to claim available username using Telethon"""
         try:
             if operation_type == 'a':  # Account username
@@ -564,8 +593,16 @@ class TelegramSniper:
         except FloodWaitError as e:
             wait_seconds = getattr(e, 'seconds', 60)
             logger.warning(f"FloodWait for {wait_seconds}s on claim_username @{username}")
-            await asyncio.sleep(min(wait_seconds, 300))  # انتظار بحد أقصى 5 دقائق
+            # Respect stop signal if provided
+            total = min(wait_seconds, 300)
+            if user_id is not None and hasattr(self, '_cancellable_sleep'):
+                await self._cancellable_sleep(user_id, total)
+            else:
+                await asyncio.sleep(total)  # fallback
             return False, f"CLAIM_ERROR: FLOOD_WAIT_{wait_seconds}"
+        except asyncio.CancelledError:
+            # Propagate cancellation so the scan loop exits immediately
+            raise
         except Exception as e:
             return False, f"CLAIM_ERROR: {str(e)}"
     
@@ -1064,6 +1101,7 @@ class TelegramSniper:
             )
         
         elif data == "start_usernames_claim":
+            logger.info(f"button_handler: user_id={user_id} → start_usernames_claim pressed")
             active_users = await self.start_all_checkers(update, context, claim_mode=True, scan_type='users')
             await query.edit_message_text(
                 "🎯 *تم تشغيل حجز اليوزرات!*\n"
@@ -1074,6 +1112,7 @@ class TelegramSniper:
             return
         
         elif data == "start_usernames_notify":
+            logger.info(f"button_handler: user_id={user_id} → start_usernames_notify pressed")
             active_users = await self.start_all_checkers(update, context, claim_mode=False, scan_type='users')
             await query.edit_message_text(
                 "🔔 *تم تشغيل إشعارات اليوزرات!*\n"
@@ -1083,6 +1122,7 @@ class TelegramSniper:
             )
             return
         elif data == "start_channels_notify":
+            logger.info(f"button_handler: user_id={user_id} → start_channels_notify pressed")
             active_users = await self.start_all_checkers(update, context, claim_mode=False, scan_type='channels')
             await query.edit_message_text(
                 "🔔 *تم تشغيل إشعارات القنوات!*\n"
@@ -1140,6 +1180,7 @@ class TelegramSniper:
             )
         
         elif data == "stop_all":
+            logger.info(f"button_handler: user_id={user_id} → stop_all pressed")
             await self.stop_all_checkers()
             await query.edit_message_text(
                 "🔴 *تم إيقاف جميع الفاحصات!*",
@@ -1275,6 +1316,7 @@ class TelegramSniper:
         """Start checking for all users with active accounts"""
         query = update.callback_query if hasattr(update, 'callback_query') else update
         user_id = query.from_user.id if hasattr(query, 'from_user') else update.effective_user.id
+        logger.info(f"start_all_checkers: user_id={user_id}, claim_mode={claim_mode}, scan_type={scan_type}")
         
         # Stop any existing task for this user (gracefully)
         if user_id in self.user_tasks:
@@ -1289,7 +1331,7 @@ class TelegramSniper:
             client = self.user_clients.get(user_id)
             if client:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
                 except Exception:
                     pass
             # Cancel and await a short time for clean exit
@@ -1300,12 +1342,14 @@ class TelegramSniper:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            logger.info(f"start_all_checkers: previous task for user_id={user_id} cancelled and cleaned up")
             
         # Check if user has active accounts
         user_accounts = self.get_user_accounts(user_id)
         active_accounts = [acc for acc in user_accounts if acc.get('active', True)]
         
         if not active_accounts:
+            logger.warning(f"start_all_checkers: user_id={user_id} has no active accounts")
             if hasattr(query, 'edit_message_text'):
                 await query.edit_message_text(
                     "❌ *لا توجد حسابات نشطة!*\n\n"
@@ -1321,9 +1365,11 @@ class TelegramSniper:
         prefs['claim_mode'] = claim_mode
         prefs['mode'] = scan_type
         self.set_user_prefs(user_id, prefs)
+        logger.info(f"start_all_checkers: prefs set and starting scan for user_id={user_id}")
         
         # Start scanning task (delegates task creation to start_user_scan)
         await self.start_user_scan(user_id, context)
+        logger.info(f"start_all_checkers: scan task scheduled for user_id={user_id}")
         return 1  # Return number of active users
     
     async def show_speed_settings(self, user_id, update, context):
@@ -1362,6 +1408,7 @@ class TelegramSniper:
     
     async def stop_all_checkers(self):
         """إيقاف جميع الفاحصات"""
+        logger.info("stop_all_checkers: requested")
         # إيقاف مهام فاحصات المستخدمين
         for user_id, task in list(self.user_tasks.items()):
             # تحديث إعدادات المستخدم وإيقاف العميل أولاً
@@ -1374,7 +1421,7 @@ class TelegramSniper:
             client = self.user_clients.get(user_id)
             if client:
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
                 except Exception:
                     pass
             # إلغاء وانتظار مدة محدودة لإيقاف المهمة
@@ -1383,6 +1430,7 @@ class TelegramSniper:
                 await asyncio.wait_for(task, timeout=5)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            logger.info(f"stop_all_checkers: stopped task for user_id={user_id}")
         
         self.user_tasks.clear()
         self.user_clients.clear()
@@ -1390,7 +1438,7 @@ class TelegramSniper:
     
     async def start_user_scan(self, user_id: int, context):
         """Start scanning for a specific user using their own accounts"""
-        
+        logger.info(f"start_user_scan: scheduling scan task for user_id={user_id}")
         async def scan_user_task():
             prefs = self.get_user_prefs(user_id)
             user_accounts = self.get_user_accounts(user_id)
@@ -1408,15 +1456,25 @@ class TelegramSniper:
             client = await self.get_user_client(user_id, active_accounts[current_account_index])
             if not client:
                 return
-            await client.start()
+            try:
+                await asyncio.wait_for(client.start(), timeout=10)
+            except Exception as e:
+                logger.error(f"start_user_scan: failed to start client for user_id={user_id}: {e}")
+                try:
+                    await context.bot.send_message(user_id, f"❌ فشل بدء الفحص: {e}")
+                except Exception:
+                    pass
+                return
             # Track active client to allow external stop
             self.user_clients[user_id] = client
             msg = await context.bot.send_message(user_id, "🔍 بدء الفحص ...")
             self.user_status_msgs[user_id] = msg.message_id
             try:
+                logger.info(f"scan_user_task: client started, entering loop for user_id={user_id}")
                 while True:
                     prefs = self.get_user_prefs(user_id)
                     if not prefs.get('running', True):
+                        logger.info(f"scan_user_task: running flag set to False, exiting for user_id={user_id}")
                         break
                     # تحديد نوع القائمة حسب وضع المستخدم
                     user_mode = prefs.get('mode', 'users')
@@ -1426,7 +1484,7 @@ class TelegramSniper:
                         usernames = self.get_user_list(user_id)
                         
                     if not usernames:
-                        await asyncio.sleep(5)
+                        await self._cancellable_sleep(user_id, 5)
                         continue
                     total = len(usernames)
                     for idx, username in enumerate(usernames, 1):
@@ -1445,7 +1503,7 @@ class TelegramSniper:
                         op_type = 'c' if user_mode == 'channels' else 'a'
                         try:
                             is_available, status = await asyncio.wait_for(
-                                self.check_username(client, username, op_type), timeout=15
+                                self.check_username(client, username, op_type, user_id=user_id), timeout=15
                             )
                         except asyncio.TimeoutError:
                             is_available, status = False, "TIMEOUT"
@@ -1459,11 +1517,15 @@ class TelegramSniper:
                         if is_available:
                             claim_mode = prefs.get('claim_mode', True)
                             if claim_mode:
+                                # تحقق سريع من إشارة الإيقاف قبل محاولة الحجز
+                                prefs = self.get_user_prefs(user_id)
+                                if not prefs.get('running', True):
+                                    break
                                 # وضع الحجز - محاولة حجز اليوزر
                                 op_type = 'c' if user_mode == 'channels' else 'a'
                                 try:
                                     claimed, _ = await asyncio.wait_for(
-                                        self.claim_username(client, username, op_type), timeout=30
+                                        self.claim_username(client, username, op_type, user_id=user_id), timeout=30
                                     )
                                 except asyncio.TimeoutError:
                                     claimed = False
@@ -1488,9 +1550,24 @@ class TelegramSniper:
                                             
                                     # التبديل إلى حساب آخر بعد الحجز لتجنب الحظر
                                     current_account_index = (current_account_index + 1) % len(active_accounts)
-                                    await client.stop()
+                                    try:
+                                        await asyncio.wait_for(client.stop(), timeout=5)
+                                    except Exception:
+                                        pass
+                                    # تحقّق سريع من إشارة الإيقاف قبل بدء عميل جديد
+                                    prefs = self.get_user_prefs(user_id)
+                                    if not prefs.get('running', True):
+                                        break
                                     client = await self.get_user_client(user_id, active_accounts[current_account_index])
-                                    await client.start()
+                                    try:
+                                        await asyncio.wait_for(client.start(), timeout=10)
+                                    except Exception as e:
+                                        logger.error(f"scan_user_task: failed to rotate/start client for user_id={user_id}: {e}")
+                                        try:
+                                            await context.bot.send_message(user_id, f"❌ فشل تبديل الحساب/بدء الجلسة: {e}")
+                                        except Exception:
+                                            pass
+                                        break
                                     # Update tracked client
                                     self.user_clients[user_id] = client
                             else:
@@ -1501,11 +1578,15 @@ class TelegramSniper:
                         base_delay = prefs.get('speed_delay', 5)
                         random_delay = __import__('random').uniform(1, 3)  # تأخير عشوائي 1-3 ثانية
                         total_delay = base_delay + random_delay
-                        await asyncio.sleep(total_delay)
+                        await self._cancellable_sleep(user_id, total_delay)
             except asyncio.CancelledError:
                 pass
             finally:
-                await client.stop()
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=5)
+                except Exception:
+                    pass
+                logger.info(f"scan_user_task: client stopped and task finishing for user_id={user_id}")
                 # Update UI message to reflect stop
                 try:
                     await context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=msg.message_id)
@@ -1574,7 +1655,8 @@ class TelegramSniper:
                 session_base = auth_data.get('session_path')  # without .session
                 src_session = f"{session_base}.session" if session_base else None
                 # Copy session to user-specific path
-                dest_session = self.get_user_session_path(user_id, phone)
+                dest_session_base = self.get_user_session_path(user_id, phone)
+                dest_session = f"{dest_session_base}.session"
                 os.makedirs(os.path.dirname(dest_session), exist_ok=True)
                 if src_session and os.path.exists(src_session):
                     try:
@@ -1593,7 +1675,7 @@ class TelegramSniper:
                 try:
                     # استخدام معرفات طبيعية للتحقق
                     client = TelegramClient(
-                        dest_session,
+                        dest_session_base,
                         api_id,
                         api_hash,
                         device_model="Samsung SM-G973F",
