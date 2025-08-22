@@ -78,12 +78,31 @@ def submit_auth():
         
         # محاولة تسجيل الدخول
         async def verify_code():
+            # تأخير عشوائي قبل التحقق
+            await asyncio.sleep(__import__('random').uniform(3, 7))
+            
             os.makedirs("temp_sessions", exist_ok=True)
             session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
-            client = TelegramClient(session_path, int(api_id), api_hash)
+            
+            # نفس المعرفات المستخدمة في طلب الكود
+            client = TelegramClient(
+                session_path,
+                int(api_id),
+                api_hash,
+                device_model="Samsung SM-G973F",
+                system_version="Android 11",
+                app_version="8.9.2",
+                lang_code="ar",
+                system_lang_code="ar",
+                proxy=None,
+                connection_retries=1,
+                retry_delay=2
+            )
             
             try:
                 await client.connect()
+                # تأخير قبل تسجيل الدخول لمحاكاة السلوك البشري
+                await asyncio.sleep(__import__('random').uniform(2, 4))
                 await client.sign_in(
                     phone=phone,
                     code=code,
@@ -181,12 +200,31 @@ def request_code():
         
         # دالة async لطلب الكود
         async def send_code():
+            # تأخير عشوائي قبل البدء لتجنب الشك
+            await asyncio.sleep(__import__('random').uniform(2, 5))
+            
             os.makedirs("temp_sessions", exist_ok=True)
             session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
-            client = TelegramClient(session_path, api_id, api_hash)
+            
+            # استخدام معرفات طبيعية أكثر لتجنب الاكتشاف
+            client = TelegramClient(
+                session_path,
+                api_id,
+                api_hash,
+                device_model="Samsung SM-G973F",
+                system_version="Android 11",
+                app_version="8.9.2",
+                lang_code="ar",
+                system_lang_code="ar",
+                proxy=None,
+                connection_retries=1,
+                retry_delay=2
+            )
             
             try:
                 await client.connect()
+                # تأخير قصير قبل طلب الكود
+                await asyncio.sleep(__import__('random').uniform(1, 3))
                 result = await client.send_code_request(phone)
                 
                 # حفظ phone_code_hash مؤقتاً
@@ -329,7 +367,7 @@ class TelegramSniper:
             'mode': 'users',
             'replace_mode': False,
             'add_mode': False,
-            'speed_delay': 2,  # التأخير بين العمليات بالثواني
+            'speed_delay': 5,  # التأخير بين العمليات بالثواني (زيادة للأمان)
             'accounts': []  # قائمة حسابات المستخدم
         }
     
@@ -496,7 +534,10 @@ class TelegramSniper:
         except UsernameInvalidError:
             return False, "غير صالح"
         except FloodWaitError as e:
-            return False, f"FLOOD_WAIT_{getattr(e, 'seconds', 60)}"
+            wait_seconds = getattr(e, 'seconds', 60)
+            logger.warning(f"FloodWait for {wait_seconds}s on check_username @{username}")
+            await asyncio.sleep(min(wait_seconds, 300))  # انتظار بحد أقصى 5 دقائق
+            return False, f"FLOOD_WAIT_{wait_seconds}"
         except Exception as e:
             return False, f"خطأ: {str(e)[:50]}..."
     
@@ -521,7 +562,10 @@ class TelegramSniper:
             else:
                 return False, "UNSUPPORTED_OPERATION"
         except FloodWaitError as e:
-            return False, f"CLAIM_ERROR: FLOOD_WAIT_{getattr(e, 'seconds', 60)}"
+            wait_seconds = getattr(e, 'seconds', 60)
+            logger.warning(f"FloodWait for {wait_seconds}s on claim_username @{username}")
+            await asyncio.sleep(min(wait_seconds, 300))  # انتظار بحد أقصى 5 دقائق
+            return False, f"CLAIM_ERROR: FLOOD_WAIT_{wait_seconds}"
         except Exception as e:
             return False, f"CLAIM_ERROR: {str(e)}"
     
@@ -784,9 +828,9 @@ class TelegramSniper:
         with open(auth_file, 'w', encoding='utf-8') as f:
             json.dump(auth_data, f, ensure_ascii=False, indent=2)
 
-    async def handle_username_input(self, update, user_id):
+    async def handle_username_input(self, update, context, user_id, message_text):
         """معالجة إضافة يوزرات جديدة"""
-        text = update.message.text.strip()
+        text = message_text.strip()
         import re
         usernames = re.findall(r'(?:https?://t\.me/)?@?([a-zA-Z0-9_]{5,32})', text)
         
@@ -814,10 +858,16 @@ class TelegramSniper:
         # إلغاء وضع الإضافة
         prefs['add_mode'] = False
         self.set_user_prefs(user_id, prefs)
+        
+        # ابدأ الفحص تلقائياً إذا كان متوقفاً
+        if not prefs.get('running', False):
+            prefs['running'] = True
+            self.set_user_prefs(user_id, prefs)
+            await self.start_user_scan(user_id, context)
 
-    async def handle_username_replacement(self, update, user_id):
+    async def handle_username_replacement(self, update, context, user_id, message_text):
         """معالجة استبدال اليوزرات"""
-        text = update.message.text.strip()
+        text = message_text.strip()
         import re
         usernames = re.findall(r'(?:https?://t\.me/)?@?([a-zA-Z0-9_]{5,32})', text)
         
@@ -1136,80 +1186,6 @@ class TelegramSniper:
                 await self.show_user_accounts(user_id, query, context)
             return
         
-        elif data == "request_new_code":
-            # طلب كود تحقق جديد
-            if user_id in self.pending_auth:
-                auth_data = self.pending_auth[user_id]
-                try:
-                    if 'client' in auth_data:
-                        await auth_data['client'].disconnect()
-                    
-                    from telethon import TelegramClient
-                    session_path = self.get_user_session_path(user_id, auth_data['phone'])
-                    client = TelegramClient(session_path, auth_data['api_id'], auth_data['api_hash'])
-                    await client.connect()
-                    await client.send_code_request(auth_data['phone'])
-                    auth_data['client'] = client
-                    auth_data['step'] = 'code'
-                    
-                    await query.edit_message_text(
-                        "📨 *تم إرسال كود جديد!*\n\n"
-                        "✅ تم إرسال كود التحقق الجديد لرقمك\n"
-                        "🔹 أرسل الكود فور استلامه\n"
-                        "🔹 الكود صالح لمدة دقيقتين فقط\n\n"
-                        "⚠️ لا تشارك الكود مع أحد!",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as e:
-                    await query.edit_message_text(
-                        f"❌ خطأ في إرسال الكود: {str(e)}\n\n"
-                        "🔄 جرب مرة أخرى لاحقاً",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    del self.pending_auth[user_id]
-            return
-
-        
-        elif data == "copy_url":
-            # زر لنسخ الرابط (مجرد تنبيه للمستخدم)
-            public_url = self.get_public_url()
-            web_url = f"https://{public_url}/auth/{user_id}"
-            await query.answer(f"انسخ هذا الرابط: {web_url}", show_alert=True)
-            return
-        
-        elif data == "check_web_auth":
-            await self.check_auth_status(query, context, user_id)
-            return
-            
-        elif data == "cancel_auth":
-            # إلغاء عملية المصادقة
-            if user_id in self.pending_auth:
-                # حاول قطع أي عميل متبقٍ في الذاكرة ثم امسح الحالة
-                auth_data = self.pending_auth[user_id]
-                if isinstance(auth_data, dict) and 'client' in auth_data:
-                    try:
-                        await auth_data['client'].disconnect()
-                    except:
-                        pass
-                del self.pending_auth[user_id]
-            
-            # احذف الملفات المؤقتة إن وجدت
-            for fname in [f"{user_id}_auth.json", f"{user_id}_temp.json", f"{user_id}_pending.json"]:
-                fpath = os.path.join("temp_auth", fname)
-                if os.path.exists(fpath):
-                    try:
-                        os.remove(fpath)
-                    except:
-                        pass
-            
-            await query.edit_message_text(
-                "❌ تم إلغاء عملية إضافة الحساب",
-                reply_markup=InlineKeyboardMarkup([[ 
-                    InlineKeyboardButton("🏠 الرئيسية", callback_data="back_main")
-                ]])
-            )
-            return
-        
         elif data.startswith("set_speed_"):
             speed_str = data.replace("set_speed_", "")
             speed = float(speed_str)
@@ -1254,7 +1230,21 @@ class TelegramSniper:
         try:
             from telethon import TelegramClient
             session_path = self.get_user_session_path(user_id, account['phone'])
-            client = TelegramClient(session_path, account['api_id'], account['api_hash'])
+            
+            # استخدام معرفات طبيعية للفحص
+            client = TelegramClient(
+                session_path,
+                account['api_id'],
+                account['api_hash'],
+                device_model="Samsung SM-G973F",
+                system_version="Android 11",
+                app_version="8.9.2",
+                lang_code="ar",
+                system_lang_code="ar",
+                proxy=None,
+                connection_retries=1,
+                retry_delay=2
+            )
             return client
         except Exception as e:
             logger.error(f"Error creating client for user {user_id}: {e}")
@@ -1321,10 +1311,10 @@ class TelegramSniper:
         current_speed = prefs.get('speed_delay', 1.0)
         
         keyboard = [
-            [InlineKeyboardButton("⚡ سريع (0.5s)", callback_data="set_speed_0.5"),
-             InlineKeyboardButton("🔥 سريع جداً (0.1s)", callback_data="set_speed_0.1")],
-            [InlineKeyboardButton("⚖️ متوسط (1.0s)", callback_data="set_speed_1.0"),
-             InlineKeyboardButton("🐌 بطيء (2.0s)", callback_data="set_speed_2.0")],
+            [InlineKeyboardButton("⚖️ متوسط (3.0s)", callback_data="set_speed_3.0"),
+         InlineKeyboardButton("🐌 بطيء (5.0s)", callback_data="set_speed_5.0")],
+        [InlineKeyboardButton("🛡️ آمن (8.0s)", callback_data="set_speed_8.0"),
+         InlineKeyboardButton("🐢 آمن جداً (15.0s)", callback_data="set_speed_15.0")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="user_settings")]
         ]
         
@@ -1486,9 +1476,11 @@ class TelegramSniper:
                                 # وضع الإشعار - إرسال إشعار فقط
                                 type_text = 'قناة' if user_mode == 'channels' else 'يوزر'
                                 await context.bot.send_message(user_id, f"🔔 {type_text} متاح: @{username}")
-                        # استخدام سرعة المستخدم المخصصة
-                        delay = prefs.get('speed_delay', 2)
-                        await asyncio.sleep(delay)
+                        # استخدام سرعة المستخدم مع تأخير عشوائي إضافي للأمان
+                        base_delay = prefs.get('speed_delay', 5)
+                        random_delay = __import__('random').uniform(1, 3)  # تأخير عشوائي 1-3 ثانية
+                        total_delay = base_delay + random_delay
+                        await asyncio.sleep(total_delay)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -1578,7 +1570,20 @@ class TelegramSniper:
                 }
                 # Try to fetch first_name
                 try:
-                    client = TelegramClient(dest_session, api_id, api_hash)
+                    # استخدام معرفات طبيعية للتحقق
+                    client = TelegramClient(
+                        dest_session,
+                        api_id,
+                        api_hash,
+                        device_model="Samsung SM-G973F",
+                        system_version="Android 11",
+                        app_version="8.9.2",
+                        lang_code="ar",
+                        system_lang_code="ar",
+                        proxy=None,
+                        connection_retries=1,
+                        retry_delay=2
+                    )
                     await client.connect()
                     me = await client.get_me()
                     if me and getattr(me, 'first_name', None):
@@ -1672,10 +1677,10 @@ class TelegramSniper:
         
         if prefs.get('add_mode'):
             # Adding usernames
-            await self.handle_username_input(update, user_id)
+            await self.handle_username_input(update, context, user_id, message_text)
         elif prefs.get('replace_mode'):
             # Replacing usernames  
-            await self.handle_username_replacement(update, user_id)
+            await self.handle_username_replacement(update, context, user_id, message_text)
 
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages for adding usernames"""
