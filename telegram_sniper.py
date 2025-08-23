@@ -388,8 +388,13 @@ class TelegramSniper:
         # Runtime maps for multi-user checking
         self.user_tasks: Dict[int, asyncio.Task] = {}
         self.user_status_msgs: Dict[int, int] = {}  # user_id -> message_id
-        self.user_clients: Dict[int, Optional[TelegramClient]] = {}  # track active clients per user
+        # Track multiple active clients per user: {user_id: {account_key(phone): client}}
+        self.user_clients: Dict[int, Dict[str, TelegramClient]] = {}
+        # Track per-account worker tasks per user: {user_id: [tasks...]}
+        self.user_account_tasks: Dict[int, List[asyncio.Task]] = {}
         self.user_cancel_events: Dict[int, asyncio.Event] = {}  # per-user cancellation events
+        # Track last reported progress for diagnostics per user
+        self.user_last_progress: Dict[int, Dict[str, int]] = {}
         self.pending_auth = {}  # المستخدمين في انتظار التحقق
         self.pending_input = {}
         self.pending_replacement = {}
@@ -478,8 +483,9 @@ class TelegramSniper:
             'mode': 'users',
             'replace_mode': False,
             'add_mode': False,
-            'speed_delay': 0.5,  # أسرع سرعة افتراضياً
+            'speed_delay': 5,  # التأخير بين العمليات بالثواني (زيادة للأمان)
             'jitter': True,    # تفعيل تأخير عشوائي إضافي للأمان
+            'max_workers': 0,  # 0 = تلقائي (استخدم جميع الحسابات النشطة)
             'accounts': []  # قائمة حسابات المستخدم
         }
     
@@ -663,27 +669,8 @@ class TelegramSniper:
     async def check_username(self, client: TelegramClient, username: str, operation_type: str, user_id: Optional[int] = None) -> Tuple[bool, str]:
         """Check if username is available using Telethon"""
         try:
-            # Attempt to resolve the username to determine its owner type
-            entity = await client.get_entity(username)
-            try:
-                from telethon.tl.types import User, UserEmpty, Chat, Channel
-            except Exception:
-                # Fallback in case Telethon types are unavailable
-                User = UserEmpty = Chat = Channel = tuple()
-            # Decide availability based on desired operation type ('a' for account, 'c' for channel)
-            if operation_type == 'a':  # looking for account username
-                # Occupied only if taken by a Telegram user/bot; usernames held by channels are acceptable
-                if isinstance(entity, (User,)):
-                    return False, "محتل"
-                else:
-                    return True, "متاح (قناة)"
-            elif operation_type in ['c', 'ch']:  # looking for channel/supergroup username
-                # Occupied only if already taken by a channel/supergroup; usernames held by users are acceptable
-                if isinstance(entity, (Channel, Chat)):
-                    return False, "محتل"
-                else:
-                    return True, "متاح (مستخدم)"
-            # Fallback: treat as occupied if we cannot confidently decide
+            # If entity resolves, the username exists (occupied)
+            await client.get_entity(username)
             return False, "محتل"
         except UsernameNotOccupiedError:
             return True, "متاح"
@@ -778,7 +765,7 @@ class TelegramSniper:
                 usernames = self.get_usernames(list_name)
                 
                 if not usernames:
-                    await asyncio.sleep(1)  # Very fast cycle for parallel scanning
+                    await asyncio.sleep(30)
                     continue
                 
                 for username in usernames:
@@ -1532,13 +1519,21 @@ class TelegramSniper:
                     evt.set()
             except Exception:
                 pass
-            # Disconnect active client (break any pending network ops)
-            client = self.user_clients.get(user_id)
-            if client:
+            # Disconnect all active clients for this user (break any pending network ops)
+            clients_map = self.user_clients.get(user_id)
+            if isinstance(clients_map, dict):
+                for acc_key, client in list(clients_map.items()):
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=3)
+                    except Exception:
+                        pass
+                self.user_clients[user_id].clear()
+            elif clients_map:  # backward safety if single client was stored
                 try:
-                    await asyncio.wait_for(client.disconnect(), timeout=3)
+                    await asyncio.wait_for(clients_map.disconnect(), timeout=3)
                 except Exception:
                     pass
+                self.user_clients[user_id] = {}
             # Cancel and await a short time for clean exit
             task = self.user_tasks.get(user_id)
             if task:
@@ -1547,6 +1542,13 @@ class TelegramSniper:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            # Cancel any per-account workers left over
+            for w in self.user_account_tasks.get(user_id, []):
+                try:
+                    w.cancel()
+                except Exception:
+                    pass
+            self.user_account_tasks[user_id] = []
             logger.info(f"start_all_checkers: previous task for user_id={user_id} cancelled and cleaned up")
             
         # Check if user has active accounts
@@ -1636,25 +1638,316 @@ class TelegramSniper:
                     evt.set()
             except Exception:
                 pass
-            client = self.user_clients.get(user_id)
-            if client:
+            # Disconnect all active clients for this user
+            clients_map = self.user_clients.get(user_id)
+            if isinstance(clients_map, dict):
+                for acc_key, client in list(clients_map.items()):
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=3)
+                    except Exception:
+                        pass
+                self.user_clients[user_id].clear()
+            elif clients_map:  # backward safety
                 try:
-                    await asyncio.wait_for(client.disconnect(), timeout=3)
+                    await asyncio.wait_for(clients_map.disconnect(), timeout=3)
                 except Exception:
                     pass
+                self.user_clients[user_id] = {}
             # إلغاء وانتظار مدة محدودة لإيقاف المهمة
             task.cancel()
             try:
                 await asyncio.wait_for(task, timeout=5)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            # Cancel per-account workers
+            for w in self.user_account_tasks.get(user_id, []):
+                try:
+                    w.cancel()
+                except Exception:
+                    pass
+            self.user_account_tasks[user_id] = []
             logger.info(f"stop_all_checkers: stopped task for user_id={user_id}")
         
         self.user_tasks.clear()
         self.user_clients.clear()
+        self.user_account_tasks.clear()
         self.user_cancel_events.clear()
         logger.info("Stopped all user checkers")
     
+    async def start_user_scan(self, user_id: int, context):
+        """Start scanning for a specific user using their own accounts concurrently."""
+        logger.info(f"start_user_scan: scheduling CONCURRENT scan task for user_id={user_id}")
+        async def scan_user_task():
+            prefs = self.get_user_prefs(user_id)
+            user_accounts = self.get_user_accounts(user_id)
+            # Setup/clear cancellation event
+            evt = self.user_cancel_events.get(user_id)
+            if evt:
+                evt.clear()
+            else:
+                evt = asyncio.Event()
+                self.user_cancel_events[user_id] = evt
+
+            # Filter active accounts
+            active_accounts = [acc for acc in user_accounts if acc.get('active', True)]
+
+            if not active_accounts:
+                await context.bot.send_message(user_id, "❌ لا توجد حسابات نشطة. يرجى إضافة حساب أو تفعيل حساب موجود")
+                return
+
+            # Initialize per-user clients map and workers list
+            self.user_clients[user_id] = {}
+            self.user_account_tasks[user_id] = []
+
+            # Status message
+            status_msg = await context.bot.send_message(user_id, "🔍 بدء الفحص المتوازي ...")
+            self.user_status_msgs[user_id] = status_msg.message_id
+
+            # Keep track of accounts that have completed a user claim (for 'users' mode)
+            claimed_accounts: set = set()
+
+            async def worker(account: Dict, queue: asyncio.Queue, processed: Dict[str, int], lock: asyncio.Lock):
+                acc_key = account.get('phone', str(id(account)))
+                # Start client for this account
+                client = await self.get_user_client(user_id, account)
+                if not client:
+                    return
+                try:
+                    await asyncio.wait_for(client.start(), timeout=10)
+                except Exception as e:
+                    logger.error(f"worker: failed to start client for {acc_key}: {e}")
+                    return
+                # Track this client
+                self.user_clients.setdefault(user_id, {})[acc_key] = client
+                logger.info(f"worker: started for account {acc_key} (user_id={user_id})")
+                try:
+                    while True:
+                        # Check stop
+                        evt_local = self.user_cancel_events.get(user_id)
+                        local_prefs = self.get_user_prefs(user_id)
+                        if (evt_local and evt_local.is_set()) or not local_prefs.get('running', True):
+                            break
+                        # If in 'users' mode and this account already claimed a username, stop this worker
+                        user_mode_local = local_prefs.get('mode', 'users')
+                        if user_mode_local == 'users' and account.get('phone') in claimed_accounts:
+                            break
+                        try:
+                            username = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        op_type = 'c' if user_mode_local == 'channels' else 'a'
+                        # Check availability
+                        try:
+                            is_available, status = await asyncio.wait_for(
+                                self.check_username(client, username, op_type, user_id=user_id), timeout=15
+                            )
+                        except asyncio.TimeoutError:
+                            is_available, status = False, "TIMEOUT"
+
+                        # Update processed counter
+                        try:
+                            async with lock:
+                                processed['done'] += 1
+                        except Exception:
+                            pass
+
+                        if is_available:
+                            claim_mode_local = local_prefs.get('claim_mode', True)
+                            if claim_mode_local:
+                                # Check stop again before claim
+                                evt_local = self.user_cancel_events.get(user_id)
+                                local_prefs = self.get_user_prefs(user_id)
+                                if (evt_local and evt_local.is_set()) or not local_prefs.get('running', True):
+                                    break
+                                try:
+                                    claimed, claim_status = await asyncio.wait_for(
+                                        self.claim_username(client, username, op_type, user_id=user_id), timeout=30
+                                    )
+                                except asyncio.TimeoutError:
+                                    claimed, claim_status = False, "TIMEOUT"
+                                if claimed:
+                                    account_name = account.get('first_name', account.get('phone', ''))
+                                    try:
+                                        await context.bot.send_message(
+                                            user_id,
+                                            f"🎉 تم حجز @{username} بنجاح!\n👤 باستخدام حساب: {account_name}"
+                                        )
+                                    except Exception:
+                                        pass
+                                    # Save and remove from lists
+                                    self.save_claimed_username(user_id, username)
+                                    if user_mode_local == 'channels':
+                                        current = self.get_user_channels(user_id)
+                                        if username in current:
+                                            current.remove(username)
+                                            self.write_user_channels(user_id, current)
+                                    else:
+                                        current = self.get_user_list(user_id)
+                                        if username in current:
+                                            current.remove(username)
+                                            self.write_user_list(user_id, current)
+                                    # For user usernames: stop this worker after a successful claim
+                                    if user_mode_local == 'users':
+                                        claimed_accounts.add(account.get('phone'))
+                                        break
+                                else:
+                                    # If user username claim hit a limit (e.g., flood/too-many-changes), stop this worker
+                                    if op_type == 'a':
+                                        status_lower = str(claim_status).lower()
+                                        if 'flood_wait' in status_lower or 'too many' in status_lower or 'change username' in status_lower:
+                                            logger.info(f"worker: stopping {acc_key} due to claim limit: {claim_status}")
+                                            break
+                        # Per-account delay
+                        base_delay = local_prefs.get('speed_delay', 5)
+                        jitter_on = local_prefs.get('jitter', True)
+                        random_delay = __import__('random').uniform(1, 3) if jitter_on else 0.0
+                        await self._cancellable_sleep(user_id, base_delay + random_delay)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    try:
+                        await asyncio.wait_for(client.stop(), timeout=5)
+                    except Exception:
+                        pass
+                    # Remove tracked client
+                    try:
+                        self.user_clients.get(user_id, {}).pop(acc_key, None)
+                    except Exception:
+                        pass
+                    logger.info(f"worker: stopped for account {acc_key} (user_id={user_id})")
+
+            try:
+                logger.info(f"scan_user_task: starting concurrent loop for user_id={user_id}")
+                while True:
+                    # Check global stop
+                    evt_local = self.user_cancel_events.get(user_id)
+                    if evt_local and evt_local.is_set():
+                        logger.info(f"scan_user_task: cancel event set, exiting for user_id={user_id}")
+                        break
+                    prefs_loop = self.get_user_prefs(user_id)
+                    if not prefs_loop.get('running', True):
+                        logger.info(f"scan_user_task: running flag False, exiting for user_id={user_id}")
+                        break
+
+                    user_mode = prefs_loop.get('mode', 'users')
+                    if user_mode == 'channels':
+                        usernames = self.get_user_channels(user_id)
+                    else:
+                        usernames = self.get_user_list(user_id)
+
+                    if not usernames:
+                        try:
+                            await asyncio.wait_for(
+                                context.bot.edit_message_text("⏳ لا توجد أسماء حالياً. الانتظار...", chat_id=user_id, message_id=status_msg.message_id),
+                                timeout=5
+                            )
+                        except Exception:
+                            pass
+                        await self._cancellable_sleep(user_id, 5)
+                        continue
+
+                    # Build a work queue for this batch
+                    queue: asyncio.Queue = asyncio.Queue()
+                    for u in usernames:
+                        queue.put_nowait(u)
+
+                    processed = {'done': 0}
+                    lock = asyncio.Lock()
+
+                    # Decide which accounts to use for this batch
+                    accounts_for_batch = list(active_accounts)
+                    if user_mode == 'users' and prefs_loop.get('claim_mode', True):
+                        # Prefer accounts that haven't claimed yet in this session
+                        accounts_for_batch = [a for a in active_accounts if a.get('phone') not in claimed_accounts]
+                        if not accounts_for_batch:
+                            # All accounts used; wait and re-check
+                            await context.bot.send_message(user_id, "ℹ️ جميع الحسابات قامت بحجز اسم واحد. إيقاف الفحص للمستخدمين.")
+                            break
+                    # Apply max_workers limit and spawn workers
+                    try:
+                        rnd = __import__('random')
+                        rnd.shuffle(accounts_for_batch)
+                    except Exception:
+                        pass
+                    max_workers_val = int(prefs_loop.get('max_workers', 0) or 0)
+                    if max_workers_val > 0 and len(accounts_for_batch) > max_workers_val:
+                        accounts_for_batch = accounts_for_batch[:max_workers_val]
+                    logger.info(
+                        f"scan_user_task: spawning {len(accounts_for_batch)} workers (max_workers={max_workers_val}, active_accounts={len(active_accounts)}) for user_id={user_id}"
+                    )
+                    # Spawn workers
+                    workers: List[asyncio.Task] = []
+                    for acc in accounts_for_batch:
+                        w = asyncio.create_task(worker(acc, queue, processed, lock))
+                        workers.append(w)
+                    self.user_account_tasks[user_id] = workers
+
+                    total = queue.qsize() + processed['done']
+                    # Update status periodically while workers run
+                    async def progress_updater():
+                        try:
+                            while any(not w.done() for w in workers):
+                                try:
+                                    done = processed['done']
+                                    percent = int((done / total) * 100) if total else 0
+                                    # Save last progress for diagnostics
+                                    try:
+                                        self.user_last_progress[user_id] = {'done': int(done), 'total': int(total), 'workers': int(len(workers))}
+                                    except Exception:
+                                        pass
+                                    text = f"🔍 جارٍ الفحص المتوازي: {done}/{total} • {percent}%\nالحسابات العاملة: {len(workers)}\nالوضع: {'قنوات' if user_mode=='channels' else 'يوزرات'}"
+                                    await context.bot.edit_message_text(text, chat_id=user_id, message_id=status_msg.message_id)
+                                except Exception:
+                                    pass
+                                await self._cancellable_sleep(user_id, 1.0)
+                        except asyncio.CancelledError:
+                            pass
+
+                    updater_task = asyncio.create_task(progress_updater())
+                    try:
+                        await asyncio.gather(*workers)
+                    finally:
+                        try:
+                            updater_task.cancel()
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(asyncio.gather(updater_task, return_exceptions=True), timeout=3)
+                        except Exception:
+                            pass
+
+                    # Batch finished, brief pause
+                    try:
+                        final_text = f"✅ تم فحص دفعة ({total}) باستخدام {len(workers)} حساب."
+                        await context.bot.edit_message_text(final_text, chat_id=user_id, message_id=status_msg.message_id)
+                    except Exception:
+                        pass
+                    await self._cancellable_sleep(user_id, 1)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                # Stop all clients
+                for acc_key, c in list(self.user_clients.get(user_id, {}).items()):
+                    try:
+                        await asyncio.wait_for(c.stop(), timeout=5)
+                    except Exception:
+                        pass
+                logger.info(f"scan_user_task: all clients stopped and task finishing for user_id={user_id}")
+                # Update UI message to reflect stop
+                try:
+                    await asyncio.wait_for(
+                        context.bot.edit_message_text("⏹️ تم إيقاف الفحص.", chat_id=user_id, message_id=status_msg.message_id),
+                        timeout=5
+                    )
+                except Exception:
+                    pass
+                self.user_clients.pop(user_id, None)
+                self.user_account_tasks.pop(user_id, None)
+                self.user_tasks.pop(user_id, None)
+        # create manager task
+        task = asyncio.create_task(scan_user_task())
+        self.user_tasks[user_id] = task
+
     def get_public_url(self):
         """Get public URL for the web app"""
         if self.public_url:
@@ -1695,6 +1988,58 @@ class TelegramSniper:
         lines.append(f"📥 عدد اليوزرات في قائمتك: {users_count}")
         lines.append(f"📺 عدد القنوات في قائمتك: {channels_count}")
         return "\n".join(lines)
+
+    def get_diag_text(self, user_id: int) -> str:
+        """بناء نص تشخيص الحالة المفصل للمستخدم"""
+        prefs = self.get_user_prefs(user_id)
+        running = prefs.get('running', False)
+        mode = prefs.get('mode', 'users')
+        claim_mode = prefs.get('claim_mode', True)
+        max_workers = int(prefs.get('max_workers', 0) or 0)
+        speed_delay = prefs.get('speed_delay', 5)
+        jitter = prefs.get('jitter', True)
+        accounts = self.get_user_accounts(user_id)
+        active_accounts = [a for a in accounts if a.get('active', True)]
+        clients_map = self.user_clients.get(user_id, {}) or {}
+        workers = self.user_account_tasks.get(user_id, []) or []
+        running_workers = sum(1 for w in workers if not w.done())
+        task = self.user_tasks.get(user_id)
+        evt = self.user_cancel_events.get(user_id)
+        progress = self.user_last_progress.get(user_id, {})
+        done = int(progress.get('done', 0) or 0)
+        total = int(progress.get('total', 0) or 0)
+        workers_count = int(progress.get('workers', len(workers)) or 0)
+        percent = int((done / total) * 100) if total else 0
+        task_state = "غير موجود"
+        if task:
+            if task.cancelled():
+                task_state = "ملغى"
+            elif task.done():
+                task_state = "منتهي"
+            else:
+                task_state = "قيد العمل"
+        lines = []
+        lines.append("🧪 تشخيص الحالة")
+        lines.append(f"🔌 تشغيل: {'نعم' if running else 'لا'} | مهمة: {task_state} | إلغاء: {'مفعل' if (evt and evt.is_set()) else 'لا'}")
+        lines.append(f"🧭 الوضع: {'يوزرات' if mode=='users' else 'قنوات'} | حجز تلقائي: {'نعم' if claim_mode else 'لا'}")
+        lines.append(f"👤 الحسابات: نشطة {len(active_accounts)}/{len(accounts)} | العملاء المتصلون: {len(clients_map)}")
+        # عرض مفاتيح العملاء باختصار
+        if clients_map:
+            try:
+                keys = list(clients_map.keys())[:10]
+                lines.append("🔑 العملاء: " + ", ".join(str(k) for k in keys))
+            except Exception:
+                pass
+        lines.append(f"👷 العمال: {running_workers}/{len(workers)} قيد التنفيذ | الحد: {max_workers if max_workers>0 else 'تلقائي'}")
+        lines.append(f"⏱️ السرعة: {speed_delay}s | عشوائية: {'نعم' if jitter else 'لا'}")
+        lines.append(f"📈 التقدم: {done}/{total} • {percent}%")
+        return "\n".join(lines)
+
+    async def diag_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """أمر تشخيص الحالة /diag"""
+        user_id = update.effective_user.id
+        text = self.get_diag_text(user_id)
+        await update.message.reply_text(text)
 
     async def check_auth_status(self, query, context, user_id: int):
         """التحقق من إتمام المصادقة عبر الويب وإضافة الحساب"""
@@ -2008,6 +2353,7 @@ class TelegramSniper:
         # Add handlers
         application.add_handler(CommandHandler("start", self.start_command))
         application.add_handler(CommandHandler("status", self.status_command))
+        application.add_handler(CommandHandler("diag", self.diag_command))
         application.add_handler(CallbackQueryHandler(self.button_handler))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), self.document_handler))
