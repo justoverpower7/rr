@@ -1712,6 +1712,19 @@ class TelegramSniper:
                 client = await self.get_user_client(user_id, account)
                 if not client:
                     return
+                # Quick cancel check before starting network connection
+                try:
+                    evt_pre = self.user_cancel_events.get(user_id)
+                    prefs_pre = self.get_user_prefs(user_id)
+                    if (evt_pre and evt_pre.is_set()) or not prefs_pre.get('running', True):
+                        logger.info(f"worker: pre-start cancel for account {acc_key} (user_id={user_id})")
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=3)
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
                 try:
                     await asyncio.wait_for(client.start(), timeout=10)
                 except Exception as e:
@@ -1726,22 +1739,29 @@ class TelegramSniper:
                         evt_local = self.user_cancel_events.get(user_id)
                         local_prefs = self.get_user_prefs(user_id)
                         if (evt_local and evt_local.is_set()) or not local_prefs.get('running', True):
+                            logger.info(f"worker: stop requested -> exiting loop (acc={acc_key}, user_id={user_id})")
                             break
                         # If in 'users' mode and this account already claimed a username, stop this worker
                         user_mode_local = local_prefs.get('mode', 'users')
                         if user_mode_local == 'users' and account.get('phone') in claimed_accounts:
+                            logger.info(f"worker: account already claimed username -> exiting (acc={acc_key})")
                             break
                         try:
                             username = queue.get_nowait()
                         except asyncio.QueueEmpty:
+                            logger.info(f"worker: queue empty -> exiting (acc={acc_key})")
                             break
                         op_type = 'c' if user_mode_local == 'channels' else 'a'
                         # Check availability
                         try:
+                            t0 = asyncio.get_event_loop().time()
                             is_available, status = await asyncio.wait_for(
                                 self.check_username(client, username, op_type, user_id=user_id), timeout=15
                             )
+                            dt = asyncio.get_event_loop().time() - t0
+                            logger.debug(f"worker: check @{username} -> {status} in {dt:.2f}s (acc={acc_key})")
                         except asyncio.TimeoutError:
+                            logger.warning(f"worker: check timeout for @{username} (acc={acc_key})")
                             is_available, status = False, "TIMEOUT"
 
                         # Update processed counter
@@ -1758,12 +1778,17 @@ class TelegramSniper:
                                 evt_local = self.user_cancel_events.get(user_id)
                                 local_prefs = self.get_user_prefs(user_id)
                                 if (evt_local and evt_local.is_set()) or not local_prefs.get('running', True):
+                                    logger.info(f"worker: stop requested before claim @{username} -> exiting (acc={acc_key})")
                                     break
                                 try:
+                                    t1 = asyncio.get_event_loop().time()
                                     claimed, claim_status = await asyncio.wait_for(
                                         self.claim_username(client, username, op_type, user_id=user_id), timeout=30
                                     )
+                                    dt1 = asyncio.get_event_loop().time() - t1
+                                    logger.info(f"worker: claim @{username} -> {claim_status} in {dt1:.2f}s (acc={acc_key})")
                                 except asyncio.TimeoutError:
+                                    logger.warning(f"worker: claim timeout for @{username} (acc={acc_key})")
                                     claimed, claim_status = False, "TIMEOUT"
                                 if claimed:
                                     account_name = account.get('first_name', account.get('phone', ''))
@@ -1888,6 +1913,11 @@ class TelegramSniper:
                         try:
                             while any(not w.done() for w in workers):
                                 try:
+                                    # Respect stop quickly
+                                    evt_up = self.user_cancel_events.get(user_id)
+                                    prefs_up = self.get_user_prefs(user_id)
+                                    if (evt_up and evt_up.is_set()) or not prefs_up.get('running', True):
+                                        break
                                     done = processed['done']
                                     percent = int((done / total) * 100) if total else 0
                                     # Save last progress for diagnostics
@@ -1896,7 +1926,10 @@ class TelegramSniper:
                                     except Exception:
                                         pass
                                     text = f"🔍 جارٍ الفحص المتوازي: {done}/{total} • {percent}%\nالحسابات العاملة: {len(workers)}\nالوضع: {'قنوات' if user_mode=='channels' else 'يوزرات'}"
-                                    await context.bot.edit_message_text(text, chat_id=user_id, message_id=status_msg.message_id)
+                                    await asyncio.wait_for(
+                                        context.bot.edit_message_text(text, chat_id=user_id, message_id=status_msg.message_id),
+                                        timeout=5
+                                    )
                                 except Exception:
                                     pass
                                 await self._cancellable_sleep(user_id, 1.0)
@@ -1932,6 +1965,15 @@ class TelegramSniper:
                         await asyncio.wait_for(c.stop(), timeout=5)
                     except Exception:
                         pass
+                # Ensure any leftover worker tasks are cancelled
+                try:
+                    for w in self.user_account_tasks.get(user_id, []):
+                        try:
+                            w.cancel()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 logger.info(f"scan_user_task: all clients stopped and task finishing for user_id={user_id}")
                 # Update UI message to reflect stop
                 try:
