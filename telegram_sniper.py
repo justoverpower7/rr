@@ -2606,3 +2606,7 @@ if __name__ == "__main__":
         print("🚀 بوت صيد أسماء المستخدمين بدأ!")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         bot.run_bot()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
