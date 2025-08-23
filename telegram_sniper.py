@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-# Unified Telegram Username Sniper Bot - Better than PHP version
-# Code Developer Mohammed Qasim : @LLLLi : @HHHHR
+
 
 import os
 import json
