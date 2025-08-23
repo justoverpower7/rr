@@ -2016,6 +2016,8 @@ class TelegramSniper:
 
                     processed = {'done': 0}
                     lock = asyncio.Lock()
+                    # Capture initial total BEFORE spawning workers to avoid race with queue consumption
+                    initial_total = queue.qsize()
 
                     # Decide which accounts to use for this batch
                     accounts_for_batch = list(active_accounts)
@@ -2044,8 +2046,8 @@ class TelegramSniper:
                         w = asyncio.create_task(worker(acc, queue, processed, lock))
                         workers.append(w)
                     self.user_account_tasks[user_id] = workers
-
-                    total = queue.qsize() + processed['done']
+                    # Freeze total for progress based on initial queue size
+                    total = initial_total
                     # Update status periodically while workers run
                     async def progress_updater():
                         try:
@@ -2090,7 +2092,7 @@ class TelegramSniper:
 
                     # Batch finished, brief pause
                     try:
-                        final_text = f"✅ تم فحص دفعة ({total}) باستخدام {len(workers)} حساب."
+                        final_text = f"✅ تم فحص دفعة ({processed['done']}) باستخدام {len(workers)} حساب."
                         await context.bot.edit_message_text(final_text, chat_id=user_id, message_id=status_msg.message_id)
                     except Exception:
                         pass
