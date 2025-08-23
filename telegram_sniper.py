@@ -42,6 +42,27 @@ if sys.platform == 'win32':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 logger = logging.getLogger(__name__)
 
+# ---- Persistent storage configuration ----
+# Base directory for all persistent data; set DATA_DIR to a mounted volume on Railway
+DATA_ROOT = os.environ.get('DATA_DIR') or os.path.join(os.getcwd(), 'data')
+# Subdirectories for auth/temp sessions/central sessions (overridable via env)
+AUTH_DIR = os.environ.get('AUTH_DIR') or os.path.join(DATA_ROOT, 'temp_auth')
+TEMP_SESSIONS_DIR = os.environ.get('TEMP_SESSIONS_DIR') or os.path.join(DATA_ROOT, 'temp_sessions')
+SESSIONS_DIR = os.environ.get('SESSIONS_DIR') or os.path.join(DATA_ROOT, 'sessions')
+
+# Ensure directories exist
+for _d in (DATA_ROOT, AUTH_DIR, TEMP_SESSIONS_DIR, SESSIONS_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except Exception:
+        pass
+
+# Log chosen directories (helps diagnose ephemeral storage use)
+try:
+    logger.info(f"Storage dirs => DATA_ROOT={DATA_ROOT}, AUTH_DIR={AUTH_DIR}, TEMP_SESSIONS_DIR={TEMP_SESSIONS_DIR}, SESSIONS_DIR={SESSIONS_DIR}")
+except Exception:
+    pass
+
 # ---- Helpers: phone and digits normalization ----
 def to_ascii_digits(s: str) -> str:
     """Convert Arabic-Indic digits to ASCII digits."""
@@ -122,7 +143,7 @@ def submit_auth():
             return jsonify({'success': False, 'error': 'كود التحقق غير صالح'})
         
         # قراءة phone_code_hash من الملف المؤقت
-        temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+        temp_file = os.path.join(AUTH_DIR, f"{user_id}_temp.json")
         if not os.path.exists(temp_file):
             return jsonify({'success': False, 'error': 'انتهت صلاحية الجلسة. أعد طلب الكود'})
             
@@ -151,8 +172,8 @@ def submit_auth():
             # تأخير عشوائي قبل التحقق
             await asyncio.sleep(__import__('random').uniform(3, 7))
             
-            os.makedirs("temp_sessions", exist_ok=True)
-            session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
+            os.makedirs(TEMP_SESSIONS_DIR, exist_ok=True)
+            session_path = os.path.join(TEMP_SESSIONS_DIR, f"{user_id}_{phone.replace('+', '')}")
             
             # نفس المعرفات المستخدمة في طلب الكود
             client = TelegramClient(
@@ -180,8 +201,8 @@ def submit_auth():
                 )
                 
                 # إنشاء session دائم
-                os.makedirs("sessions", exist_ok=True)
-                permanent_session = f"sessions/{user_id}_{phone.replace('+', '')}"
+                os.makedirs(SESSIONS_DIR, exist_ok=True)
+                permanent_session = os.path.join(SESSIONS_DIR, f"{user_id}_{phone.replace('+', '')}")
                 
                 # نسخ الجلسة للمجلد الدائم
                 if os.path.exists(f"{session_path}.session"):
@@ -236,10 +257,10 @@ def submit_auth():
                 'api_hash': api_hash,
                 'timestamp': datetime.now().isoformat(),
                 'status': 'completed',
-                'session_path': f"sessions/{user_id}_{phone.replace('+', '')}"
+                'session_path': os.path.join(SESSIONS_DIR, f"{user_id}_{phone.replace('+', '')}")
             }
             
-            final_file = os.path.join("temp_auth", f"{user_id}_auth.json")
+            final_file = os.path.join(AUTH_DIR, f"{user_id}_auth.json")
             with open(final_file, 'w', encoding='utf-8') as f:
                 json.dump(auth_data, f, ensure_ascii=False, indent=2)
             
@@ -248,7 +269,7 @@ def submit_auth():
                 os.remove(temp_file)
             # Cleanup temp session file
             try:
-                temp_session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}.session"
+                temp_session_path = os.path.join(TEMP_SESSIONS_DIR, f"{user_id}_{phone.replace('+', '')}.session")
                 if os.path.exists(temp_session_path):
                     os.remove(temp_session_path)
             except Exception:
@@ -288,8 +309,8 @@ def request_code():
             return jsonify({'success': False, 'error': 'API HASH غير صالح'})
 
         # Simple throttle by previous temp request timestamp
-        os.makedirs("temp_auth", exist_ok=True)
-        temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+        os.makedirs(AUTH_DIR, exist_ok=True)
+        temp_file = os.path.join(AUTH_DIR, f"{user_id}_temp.json")
         try:
             if os.path.exists(temp_file):
                 with open(temp_file, 'r', encoding='utf-8') as f:
@@ -310,8 +331,8 @@ def request_code():
             # تأخير عشوائي قبل البدء لتجنب الشك
             await asyncio.sleep(__import__('random').uniform(2, 5))
             
-            os.makedirs("temp_sessions", exist_ok=True)
-            session_path = f"temp_sessions/{user_id}_{phone.replace('+', '')}"
+            os.makedirs(TEMP_SESSIONS_DIR, exist_ok=True)
+            session_path = os.path.join(TEMP_SESSIONS_DIR, f"{user_id}_{phone.replace('+', '')}")
             
             # استخدام معرفات طبيعية أكثر لتجنب الاكتشاف
             client = TelegramClient(
@@ -335,8 +356,8 @@ def request_code():
                 result = await client.send_code_request(phone)
                 
                 # حفظ phone_code_hash مؤقتاً مع ربط الطلب بالهاتف و API
-                os.makedirs("temp_auth", exist_ok=True)
-                temp_file = os.path.join("temp_auth", f"{user_id}_temp.json")
+                os.makedirs(AUTH_DIR, exist_ok=True)
+                temp_file = os.path.join(AUTH_DIR, f"{user_id}_temp.json")
                 temp_data = {
                     'phone_code_hash': result.phone_code_hash,
                     'phone': phone,  # normalized
@@ -457,7 +478,7 @@ class TelegramSniper:
     
     # ---------- Per-user storage helpers ----------
     def get_user_dir(self, user_id: int) -> str:
-        path = os.path.join('data', str(user_id))
+        path = os.path.join(DATA_ROOT, str(user_id))
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -466,7 +487,7 @@ class TelegramSniper:
 
     def get_user_prefs(self, user_id: int) -> Dict:
         """Get user preferences"""
-        data_dir = os.path.join(os.getcwd(), 'data', str(user_id))
+        data_dir = os.path.join(DATA_ROOT, str(user_id))
         prefs_file = os.path.join(data_dir, 'prefs.json')
         
         if os.path.exists(prefs_file):
@@ -851,8 +872,6 @@ class TelegramSniper:
         mode = prefs.get('mode', 'users')
         running = prefs.get('running', False)
         keyboard = [
-            [InlineKeyboardButton("👤 فحص يوزرات", callback_data="mode_users"),
-             InlineKeyboardButton("📺 فحص قنوات", callback_data="mode_channels")],
             [InlineKeyboardButton("➕ إضافة أسماء", callback_data="add_names")],
             [InlineKeyboardButton("⚡ السرعة", callback_data="speed_settings")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]
@@ -919,8 +938,8 @@ class TelegramSniper:
 
     async def handle_auth_flow(self, update, context, user_id, message_text):
         """معالجة عملية إضافة حساب جديد"""
-        # تحقق من ملفات temp_auth بدلاً من الذاكرة فقط
-        auth_file = os.path.join("temp_auth", f"{user_id}_auth.json")
+        # تحقق من ملفات AUTH_DIR بدلاً من الذاكرة فقط
+        auth_file = os.path.join(AUTH_DIR, f"{user_id}_auth.json")
         if user_id not in self.pending_auth:
             if not os.path.exists(auth_file):
                 return
@@ -1001,8 +1020,8 @@ class TelegramSniper:
             auth_data['timestamp'] = datetime.now().isoformat()
         
         # Save auth data (pending) - keep separate from final auth file
-        os.makedirs("temp_auth", exist_ok=True)
-        auth_file = os.path.join("temp_auth", f"{user_id}_pending.json")
+        os.makedirs(AUTH_DIR, exist_ok=True)
+        auth_file = os.path.join(AUTH_DIR, f"{user_id}_pending.json")
         with open(auth_file, 'w', encoding='utf-8') as f:
             json.dump(auth_data, f, ensure_ascii=False, indent=2)
 
@@ -1460,7 +1479,7 @@ class TelegramSniper:
             try:
                 phone_no_plus = account['phone'].replace('+', '')
                 dest_session_file = f"{session_path}.session"
-                central_base = os.path.join("sessions", f"{user_id}_{phone_no_plus}")
+                central_base = os.path.join(SESSIONS_DIR, f"{user_id}_{phone_no_plus}")
                 central_session_file = f"{central_base}.session"
                 if not os.path.exists(dest_session_file) and os.path.exists(central_session_file):
                     # Prefer copying into the per-user data dir for consistency
@@ -1676,7 +1695,7 @@ class TelegramSniper:
     
     async def start_user_scan(self, user_id: int, context):
         """Start scanning for a specific user using their own accounts concurrently."""
-        logger.info(f"start_user_scan: scheduling CONCURRENT scan task for user_id={user_id}")
+        logger.info(f"start_user_scan: scheduling scan task for user_id={user_id}")
         async def scan_user_task():
             prefs = self.get_user_prefs(user_id)
             user_accounts = self.get_user_accounts(user_id)
@@ -1699,8 +1718,8 @@ class TelegramSniper:
             self.user_clients[user_id] = {}
             self.user_account_tasks[user_id] = []
 
-            # Status message
-            status_msg = await context.bot.send_message(user_id, "🔍 بدء الفحص المتوازي ...")
+            # Status message (generic; detailed mode shown in progress updates)
+            status_msg = await context.bot.send_message(user_id, "🔍 بدء الفحص ...")
             self.user_status_msgs[user_id] = status_msg.message_id
 
             # Keep track of accounts that have completed a user claim (for 'users' mode)
@@ -1925,7 +1944,8 @@ class TelegramSniper:
                                         self.user_last_progress[user_id] = {'done': int(done), 'total': int(total), 'workers': int(len(workers))}
                                     except Exception:
                                         pass
-                                    text = f"🔍 جارٍ الفحص المتوازي: {done}/{total} • {percent}%\nالحسابات العاملة: {len(workers)}\nالوضع: {'قنوات' if user_mode=='channels' else 'يوزرات'}"
+                                    mode_label = 'التسلسلي' if len(workers) == 1 else 'المتوازي'
+                                    text = f"🔍 جارٍ الفحص {mode_label}: {done}/{total} • {percent}%\nالحسابات العاملة: {len(workers)}\nالوضع: {'قنوات' if user_mode=='channels' else 'يوزرات'}"
                                     await asyncio.wait_for(
                                         context.bot.edit_message_text(text, chat_id=user_id, message_id=status_msg.message_id),
                                         timeout=5
@@ -2086,10 +2106,9 @@ class TelegramSniper:
     async def check_auth_status(self, query, context, user_id: int):
         """التحقق من إتمام المصادقة عبر الويب وإضافة الحساب"""
         try:
-            auth_dir = "temp_auth"
-            os.makedirs(auth_dir, exist_ok=True)
-            final_file = os.path.join(auth_dir, f"{user_id}_auth.json")
-            temp_file = os.path.join(auth_dir, f"{user_id}_temp.json")
+            os.makedirs(AUTH_DIR, exist_ok=True)
+            final_file = os.path.join(AUTH_DIR, f"{user_id}_auth.json")
+            temp_file = os.path.join(AUTH_DIR, f"{user_id}_temp.json")
             if os.path.exists(final_file):
                 with open(final_file, 'r', encoding='utf-8') as f:
                     auth_data = json.load(f)
