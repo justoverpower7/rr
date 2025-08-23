@@ -385,7 +385,11 @@ def request_code():
         success, message = loop.run_until_complete(send_code())
         loop.close()
         
-        return jsonify({'success': success, 'message': message})
+        # Return consistent schema: use 'error' on failure so frontend shows it
+        if success:
+            return jsonify({'success': True, 'message': message})
+        else:
+            return jsonify({'success': False, 'error': message})
         
     except Exception as e:
         return jsonify({'success': False, 'error': f'خطأ غير متوقع: {str(e)}'})
@@ -2016,6 +2020,8 @@ class TelegramSniper:
 
                     processed = {'done': 0}
                     lock = asyncio.Lock()
+                    # Capture initial total BEFORE spawning workers to avoid race with queue consumption
+                    initial_total = queue.qsize()
 
                     # Decide which accounts to use for this batch
                     accounts_for_batch = list(active_accounts)
@@ -2044,8 +2050,8 @@ class TelegramSniper:
                         w = asyncio.create_task(worker(acc, queue, processed, lock))
                         workers.append(w)
                     self.user_account_tasks[user_id] = workers
-
-                    total = queue.qsize() + processed['done']
+                    # Freeze total for progress based on initial queue size
+                    total = initial_total
                     # Update status periodically while workers run
                     async def progress_updater():
                         try:
@@ -2090,7 +2096,7 @@ class TelegramSniper:
 
                     # Batch finished, brief pause
                     try:
-                        final_text = f"✅ تم فحص دفعة ({total}) باستخدام {len(workers)} حساب."
+                        final_text = f"✅ تم فحص دفعة ({processed['done']}) باستخدام {len(workers)} حساب."
                         await context.bot.edit_message_text(final_text, chat_id=user_id, message_id=status_msg.message_id)
                     except Exception:
                         pass
@@ -2600,7 +2606,3 @@ if __name__ == "__main__":
         print("🚀 بوت صيد أسماء المستخدمين بدأ!")
         print(f"Admin ID: {bot.config.get('admin_id', 'Not set')}")
         bot.run_bot()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
