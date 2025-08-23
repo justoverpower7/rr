@@ -915,7 +915,10 @@ class TelegramSniper:
                 text += f"{status} {phone}\n"
                 
                 toggle_text = "إلغاء تفعيل" if acc.get('active', True) else "تفعيل"
-                keyboard.append([InlineKeyboardButton(f"{toggle_text} {phone}", callback_data=f"toggle_account_{i}")])
+                keyboard.append([
+                    InlineKeyboardButton(f"{toggle_text} {phone}", callback_data=f"toggle_account_{i}"),
+                    InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_account_{i}")
+                ])
             
             keyboard.extend([
                 [InlineKeyboardButton("➕ إضافة حساب جديد", callback_data="add_account")],
@@ -1417,6 +1420,122 @@ class TelegramSniper:
                 
                 # إعادة عرض قائمة الحسابات
                 await self.show_user_accounts(user_id, query, context)
+            return
+        
+        elif data.startswith("delete_account_"):
+            # عرض تأكيد حذف حساب تليجرام
+            try:
+                account_index = int(data.replace("delete_account_", ""))
+            except ValueError:
+                await query.answer("❌ طلب غير صالح", show_alert=True)
+                return
+            prefs = self.get_user_prefs(user_id)
+            # منع التأكيد أثناء التشغيل
+            task = self.user_tasks.get(user_id)
+            workers = self.user_account_tasks.get(user_id, [])
+            running = bool(prefs.get('running', False)) or (task and not task.done()) or any(not w.done() for w in workers)
+            if running:
+                await query.answer("⚠️ أوقف الفحص أولاً قبل حذف أي حساب", show_alert=True)
+                return
+            accounts = prefs.get('accounts', [])
+            if not (0 <= account_index < len(accounts)):
+                await query.answer("❌ الحساب غير موجود", show_alert=True)
+                return
+            acc = accounts[account_index]
+            phone = acc.get('phone', '') or ''
+            phone_no_plus = phone.replace('+', '')
+            # رسالة تأكيد
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأكيد الحذف", callback_data=f"confirm_delete_{phone_no_plus}")],
+                [InlineKeyboardButton("❎ إلغاء", callback_data="cancel_delete")]
+            ])
+            try:
+                await query.edit_message_text(
+                    f"⚠️ هل أنت متأكد من حذف الحساب {phone}؟\n"
+                    f"سيتم فصل العميل وحذف كل ملفات الجلسة المرتبطة.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb
+                )
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    logger.error(f"Error showing delete confirmation: {e}")
+            return
+
+        elif data.startswith("confirm_delete_"):
+            # تنفيذ الحذف بعد التأكيد
+            phone_no_plus = data.replace("confirm_delete_", "")
+            prefs = self.get_user_prefs(user_id)
+            # منع الحذف أثناء تشغيل الفاحصات لتجنب تعارض المهام
+            task = self.user_tasks.get(user_id)
+            workers = self.user_account_tasks.get(user_id, [])
+            running = bool(prefs.get('running', False)) or (task and not task.done()) or any(not w.done() for w in workers)
+            if running:
+                await query.answer("⚠️ أوقف الفحص أولاً قبل حذف أي حساب", show_alert=True)
+                return
+            accounts = prefs.get('accounts', [])
+            # ابحث عن الحساب حسب الرقم
+            idx = -1
+            phone = None
+            for i, a in enumerate(accounts):
+                p = a.get('phone', '') or ''
+                if p.replace('+', '') == phone_no_plus:
+                    idx = i
+                    phone = p
+                    break
+            if idx == -1:
+                await query.answer("❌ الحساب غير موجود", show_alert=True)
+                await self.show_user_accounts(user_id, query, context)
+                return
+            # حذف الحساب من التفضيلات
+            acc = accounts.pop(idx)
+            prefs['accounts'] = accounts
+            self.set_user_prefs(user_id, prefs)
+
+            # حاول فصل أي عميل نشط لهذا الحساب
+            try:
+                client_map = self.user_clients.get(user_id, {})
+                client = client_map.pop(phone, None)
+                if client:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # تنظيف ملفات الجلسة (مجلد المستخدم + المجلد المركزي + المؤقت)
+            try:
+                removed_files = []
+                user_base = self.get_user_session_path(user_id, phone)
+                central_base = os.path.join(SESSIONS_DIR, f"{user_id}_{phone_no_plus}")
+                temp_base = os.path.join(TEMP_SESSIONS_DIR, f"{user_id}_{phone_no_plus}")
+                # الأنماط المحتملة لملفات SQLite
+                suffixes = [".session", ".session-journal", ".session-wal", ".session-shm"]
+                for base in (user_base, central_base, temp_base):
+                    for suf in suffixes:
+                        path = f"{base}{suf}"
+                        try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                                removed_files.append(path)
+                        except Exception:
+                            pass
+                if removed_files:
+                    logger.info(f"Deleted {len(removed_files)} session file(s) for {phone} (user_id={user_id})")
+            except Exception as e:
+                logger.warning(f"Session cleanup failed for {phone} (user_id={user_id}): {e}")
+
+            try:
+                await query.answer("🗑️ تم حذف الحساب", show_alert=False)
+            except Exception:
+                pass
+            # تحديث الواجهة
+            await self.show_user_accounts(user_id, query, context)
+            return
+
+        elif data == "cancel_delete":
+            # إلغاء التأكيد والعودة لقائمة الحسابات
+            await self.show_user_accounts(user_id, query, context)
             return
         
         elif data.startswith("set_speed_"):
